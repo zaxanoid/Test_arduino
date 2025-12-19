@@ -1,20 +1,20 @@
 // -----------------------------------------------------------------------------
 // Module 2: Masthead Protection + PTT (Arduino Nano/Teensy + MCP2515)
 // -----------------------------------------------------------------------------
-// Defaults:
-//   - 1x DHT11 (temp + humidity)   [or DHT12 via I2C]
-//   - 1x DS18B20 (temp)            [optionally 2x DS18B20]
-//   - Telemetry is suppressed while PTT is ON (RF protection), configurable by compile-time flag
+// Pin mappings:
+//   LED=4, DHTPIN=8, PSU_Volts=A1, FWD=A2, REV=A3, MCP2515 CS=10
+//   PTT_OUT=3, PTT_SENSE=2
 //
-// CAN protocol: rscp_can_protocol.h (v1.5)
-//   - RSCP_ID_PTT_CMD / RSCP_ID_PTT_ACK
-//   - RSCP_ID_HEARTBEAT (suppressed while PTT is ON)
-//   - RSCP_ID_RF_TELEM
-//   - RSCP_ID_TEMP_REPORT (1 or 2 temps, labeled sensorId 1/2)
-//   - RSCP_ID_HUM_REPORT (humidity + DHT temp)
+// Defaults requested:
+//   - 1x DHT11 (temp + humidity)
+//   - 1x DS18B20 (temp)
 //
-// NOTE: MCP2515 oscillator:
-//   Set MCP_8MHZ vs MCP_16MHZ to match your CAN module crystal.
+// Options:
+//   - Use DHT12 instead of DHT11 (I2C)
+//   - Use 2x DS18B20 (second temp in unused ENV_TELEM bytes [5..6])
+//
+// Protocol: rscp_can_protocol.h (v1.4)
+//   RSCP_ID_ENV_TELEM: temp_c_x10(int16 LE), rh_pct(uint8), ds18_c_x10(int16 LE) or 0x7FFF
 // -----------------------------------------------------------------------------
 
 #include <SPI.h>
@@ -92,7 +92,6 @@ struct MastSettings {
   uint32_t magic;
   uint32_t stopPttErrMask; // RSCP_ERR_* bitmask
   uint32_t pttMaxMs;
-
   // Threshold placeholders (calibrate later)
   uint32_t vbat_low_raw;
   uint32_t vswr1_high_raw;
@@ -109,16 +108,13 @@ MastSettings cfg;
 static bool     ptt_requested = false;
 static uint8_t  last_ptt_seq = 0;
 static uint32_t ptt_on_ms = 0;
-static uint32_t ptt_cmd_rx_ms = 0;
-static bool     last_overtime_drop = false;
 
 static uint32_t err_bits = 0; // latched
 static bool     err_changed = false;
 
 // Telemetry
-static int16_t  dht_temp_c_x10 = (int16_t)0x7FFF;
-static uint16_t dht_rh_x10 = 0xFFFF;
-
+static int16_t  temp_c_x10 = (int16_t)0x7FFF;
+static uint8_t  rh_pct = 0xFF;
 static int16_t  ds18_1_c_x10 = (int16_t)0x7FFF;
 static int16_t  ds18_2_c_x10 = (int16_t)0x7FFF;
 
@@ -177,84 +173,55 @@ static void canSend8(uint16_t id, const uint8_t d[8]) {
 }
 
 static void sendHeartbeat() {
-  // Suppress heartbeat while PTT is ON (per project requirement)
-  if (ptt_requested) return;
-
   uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
+  d[0] = RSCP_MOD_MAST;
   d[1] = (ptt_requested ? 0x01 : 0x00);
   uint32_t up_s = millis() / 1000UL;
   rscp_put_u32(&d[2], up_s);
-  d[6] = 1;  // fwMajor (placeholder)
-  d[7] = 0;  // fwMinor (placeholder)
   canSend8(RSCP_ID_HEARTBEAT, d);
 }
 
 static void sendBoot() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
+  d[0] = RSCP_MOD_MAST;
   d[1] = 0; // reset cause placeholder
   d[2] = RSCP_PROTO_VER_MAJOR;
   d[3] = RSCP_PROTO_VER_MINOR;
   canSend8(RSCP_ID_BOOT, d);
 }
 
-static void sendPttAck(uint8_t result) {
+static void sendPttStatus(bool confirmed) {
   uint8_t d[8] = {0};
-
   d[0] = ptt_requested ? RSCP_PTT_ON : RSCP_PTT_OFF;
   d[1] = last_ptt_seq;
-  d[2] = result;                    // 0 OK, 1 FAIL
-  d[3] = last_overtime_drop ? 1 : 0; // overtimeDrop
-
-  // Clamp latency to uint16 max (Arduino-safe, no templates)
-  uint32_t delta = (uint32_t)(millis() - ptt_cmd_rx_ms);
-  uint16_t lat = (delta > 65535UL) ? 65535U : (uint16_t)delta;
-  rscp_put_u16(&d[4], lat);
-
-  d[6] = 0;                         // flags
-  d[7] = RSCP_NODE_MAST;
-
-  canSend8(RSCP_ID_PTT_ACK, d);
+  d[2] = confirmed ? 0x01 : 0x00;        // status_flags bit0=confirmed
+  d[3] = (err_bits != 0) ? 1 : 0;         // err_latched flag
+  canSend8(RSCP_ID_PTT_STATUS, d);
 }
-
 
 static void sendErrStatus(uint8_t severity) {
   uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
+  d[0] = RSCP_MOD_MAST;
   d[1] = severity;
   rscp_put_u32(&d[2], err_bits);
-  d[6] = 0; // faultCode
-  d[7] = 0; // faultDetail
   canSend8(RSCP_ID_ERR_STATUS, d);
 }
 
-static void sendTempReport() {
+static void sendEnvTelem() {
+  // RSCP_ID_ENV_TELEM (header-defined fields):
+  //   [0..1] temp_c_x10 (int16)
+  //   [2]    rh_pct (uint8)
+  //   [3..4] ds18_c_x10 (int16) or 0x7FFF
+  // Additional (safe): [5..6] ds18_2_c_x10 (int16) if present, else 0x7FFF
   uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
-  d[1] = (uint8_t)DS18_COUNT;
-  d[2] = 1; // sensorId1
-  d[3] = (DS18_COUNT >= 2) ? 2 : 0; // sensorId2
-  rscp_put_i16(&d[4], ds18_1_c_x10);
-  rscp_put_i16(&d[6], (DS18_COUNT >= 2) ? ds18_2_c_x10 : (int16_t)0x7FFF);
-  canSend8(RSCP_ID_TEMP_REPORT, d);
-}
 
-static void sendHumReport(uint8_t seq) {
-  uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
-#if USE_DHT11
-  d[1] = 11;
-#elif USE_DHT12
-  d[1] = 12;
-#else
-  d[1] = 0;
-#endif
-  rscp_put_u16(&d[2], dht_rh_x10);
-  rscp_put_i16(&d[4], dht_temp_c_x10);
-  d[6] = 0; // status (0 OK; nonzero could be "invalid" later)
-  d[7] = seq;
-  canSend8(RSCP_ID_HUM_REPORT, d);
+  rscp_put_i16(&d[0], temp_c_x10);
+  d[2] = rh_pct;
+  rscp_put_i16(&d[3], ds18_1_c_x10);
+  rscp_put_i16(&d[5], ds18_2_c_x10);
+  d[7] = 0;
+
+  canSend8(RSCP_ID_ENV_TELEM, d);
 }
 
 static void sendRfTelem() {
@@ -291,17 +258,17 @@ static void applyPttOut(bool on) {
 }
 
 // ------------------------- Sensor reading
-static bool readDht_x10(int16_t &t10, uint16_t &rh10) {
+static bool readDht_x10(int16_t &t10, uint8_t &rh) {
 #if USE_DHT11
   float t = dht.readTemperature();
   float h = dht.readHumidity();
   if (isnan(t) || isnan(h)) return false;
 
   t10 = (int16_t)(t * 10.0f);
-  int rh = (int)(h * 10.0f + 0.5f);
-  if (rh < 0) rh = 0;
-  if (rh > 1000) rh = 1000;
-  rh10 = (uint16_t)rh;
+  int hi = (int)(h + 0.5f);
+  if (hi < 0) hi = 0;
+  if (hi > 100) hi = 100;
+  rh = (uint8_t)hi;
   return true;
 #endif
 
@@ -320,11 +287,10 @@ static bool readDht_x10(int16_t &t10, uint16_t &rh10) {
   uint8_t sum = (uint8_t)(b[0] + b[1] + b[2] + b[3]);
   if (sum != b[4]) return false;
 
-  uint16_t hum10 = (uint16_t)(b[0] * 10 + b[1]);
+  rh = b[0];
+
   int16_t temp10 = (int16_t)(b[2] * 10 + (b[3] & 0x7F));
   if (b[3] & 0x80) temp10 = -temp10;
-
-  rh10 = hum10;
   t10 = temp10;
   return true;
 #endif
@@ -348,30 +314,24 @@ static void processCan() {
       case RSCP_ID_EMERG_PTT_OFF:
         ptt_requested = false;
         applyPttOut(false);
-        last_overtime_drop = false;
-        sendPttAck(0);
+        sendPttStatus(false);
         break;
 
       case RSCP_ID_PTT_CMD:
         if (rx.can_dlc >= 2) {
           bool on = rx.data[0] != 0;
           last_ptt_seq = rx.data[1];
-          ptt_cmd_rx_ms = millis();
-          last_overtime_drop = false;
-
           ptt_requested = on;
           if (on) ptt_on_ms = millis();
           applyPttOut(on);
-
-          // Fast ACK (confirmation is checked in main loop)
-          sendPttAck(0);
+          // confirm check happens in main loop
         }
         break;
 
       case RSCP_ID_ERR_CLEAR:
         if (rx.can_dlc >= 6) {
           uint8_t target = rx.data[0];
-          if (target == RSCP_NODE_MAST || target == 0) {
+          if (target == RSCP_MOD_MAST || target == 0) {
             uint32_t mask = rscp_get_u32(&rx.data[2]);
             clearErrMask(mask);
             sendErrStatus((err_bits == 0) ? RSCP_SEV_INFO : RSCP_SEV_ERROR);
@@ -380,8 +340,8 @@ static void processCan() {
         break;
 
       case RSCP_ID_CFG_SET:
-        // v1.5 format: [0]=targetNode [1]=key [2..5]=value32 [6]=flags [7]=seq
-        if (rx.can_dlc >= 6 && (rx.data[0] == RSCP_NODE_MAST)) {
+        // header: module_id, key, value at data[2..5]
+        if (rx.can_dlc >= 6 && rx.data[0] == RSCP_MOD_MAST) {
           uint8_t  key = rx.data[1];
           uint32_t val = rscp_get_u32(&rx.data[2]);
 
@@ -396,13 +356,11 @@ static void processCan() {
 
           EEPROM.put(0, cfg);
 
-          // ACK: nodeId, key, result, seq, appliedValue32
+          // ACK (8 bytes)
           uint8_t d[8] = {0};
-          d[0] = RSCP_NODE_MAST;
+          d[0] = RSCP_MOD_MAST;
           d[1] = key;
-          d[2] = 0; // OK
-          d[3] = (rx.can_dlc >= 8) ? rx.data[7] : 0;
-          rscp_put_u32(&d[4], val);
+          d[2] = 0; // status ok
           canSend8(RSCP_ID_CFG_ACK, d);
         }
         break;
@@ -462,23 +420,19 @@ void loop() {
     latchErr(RSCP_ERR_OVERTIME);
     ptt_requested = false;
     applyPttOut(false);
-    last_overtime_drop = true;
-    sendPttAck(0);
   }
 
-  // Sense/confirm failure (only when we expect ON)
+  // Sense/confirm failure
   if (ptt_requested && PTT_SENSE_ENABLE && !confirmed) {
     latchErr(RSCP_ERR_PTT_FAIL);
     ptt_requested = false;
     applyPttOut(false);
-    sendPttAck(1);
   }
 
   // If any configured STOP errors are set, drop PTT
   if (ptt_requested && (err_bits & cfg.stopPttErrMask)) {
     ptt_requested = false;
     applyPttOut(false);
-    sendPttAck(1);
   }
 
   // Push immediate error status if changed
@@ -487,73 +441,91 @@ void loop() {
     sendErrStatus((err_bits & cfg.stopPttErrMask) ? RSCP_SEV_FATAL : RSCP_SEV_ERROR);
   }
 
-  // 3) Cooperative scheduler
+  // Report PTT status on state changes only
+  static bool prev_ptt = false;
+  if (ptt_requested != prev_ptt) {
+    prev_ptt = ptt_requested;
+    sendPttStatus(confirmed && ptt_requested);
+  }
+
+  // 3) Cooperative scheduler: one non-PTT task per loop
+  static uint8_t rr = 0;
+  rr = (rr + 1) % 5;
+
   uint32_t now = millis();
 
-  // Heartbeat (every 5s, suppressed while PTT is ON)
-  if (now - last_hb_ms >= 5000) { last_hb_ms = now; sendHeartbeat(); }
+  if (rr == 0) {
+    // Heartbeat every 1s
+    if (now - last_hb_ms >= 1000) { last_hb_ms = now; sendHeartbeat(); }
 
-  // RF telem (500ms)
-  if (now - last_rf_ms >= 500) {
-    last_rf_ms = now;
+  } else if (rr == 1) {
+    // Env sensors every 2s (optional suppress while PTT on)
+    if (now - last_env_ms >= 2000) {
+      last_env_ms = now;
 
-    vbat_raw = analogRead(PIN_VBAT);
-    fwd_raw  = analogRead(PIN_FWD);
-    rev_raw  = analogRead(PIN_REV);
-
-    vswr_state  = calcVswrState(fwd_raw, rev_raw);
-    drive_state = calcDriveState(fwd_raw);
-
-    if (vswr_state == RSCP_VSWR_HIGH) latchErr(RSCP_ERR_VSWR_HIGH);
-
-    sendRfTelem();
-  }
-
-  // Env sensors (2s) and temp/hum reports (suppressed while PTT on if enabled)
-  static uint8_t humSeq = 0;
-  if (now - last_env_ms >= 2000) {
-    last_env_ms = now;
-
-    if (SUPPRESS_ENV_WHEN_PTT_ON && ptt_requested) {
-      dht_temp_c_x10 = (int16_t)0x7FFF;
-      dht_rh_x10 = 0xFFFF;
-      ds18_1_c_x10 = (int16_t)0x7FFF;
-      ds18_2_c_x10 = (int16_t)0x7FFF;
-    } else {
-      // DHT
-      int16_t t10; uint16_t rh10;
-      if (!readDht_x10(t10, rh10)) {
-        latchErr(RSCP_ERR_SENSOR_FAIL);
-        dht_temp_c_x10 = (int16_t)0x7FFF;
-        dht_rh_x10 = 0xFFFF;
+      if (SUPPRESS_ENV_WHEN_PTT_ON && ptt_requested) {
+        // mark invalid + don't spam errors due to RF
+        temp_c_x10 = (int16_t)0x7FFF;
+        rh_pct = 0xFF;
+        ds18_1_c_x10 = (int16_t)0x7FFF;
+        ds18_2_c_x10 = (int16_t)0x7FFF;
       } else {
-        dht_temp_c_x10 = t10;
-        dht_rh_x10 = rh10;
+        // DHT
+        int16_t t10;
+        uint8_t rh;
+        if (!readDht_x10(t10, rh)) {
+          latchErr(RSCP_ERR_SENSOR_FAIL);
+          temp_c_x10 = (int16_t)0x7FFF;
+          rh_pct = 0xFF;
+        } else {
+          temp_c_x10 = t10;
+          rh_pct = rh;
+        }
+
+        // DS18 #1
+        bool ok1 = false;
+        ds18_1_c_x10 = readDs18_x10(ds18_1, ok1);
+        if (!ok1) latchErr(RSCP_ERR_SENSOR_FAIL);
+
+        // DS18 #2 optional
+#if DS18_COUNT == 2
+        bool ok2 = false;
+        ds18_2_c_x10 = readDs18_x10(ds18_2, ok2);
+        if (!ok2) latchErr(RSCP_ERR_SENSOR_FAIL);
+#else
+        ds18_2_c_x10 = (int16_t)0x7FFF;
+#endif
       }
 
-      // DS18 #1
-      bool ok1 = false;
-      ds18_1_c_x10 = readDs18_x10(ds18_1, ok1);
-      if (!ok1) latchErr(RSCP_ERR_SENSOR_FAIL);
-
-      // DS18 #2 optional
-#if DS18_COUNT == 2
-      bool ok2 = false;
-      ds18_2_c_x10 = readDs18_x10(ds18_2, ok2);
-      if (!ok2) latchErr(RSCP_ERR_SENSOR_FAIL);
-#else
-      ds18_2_c_x10 = (int16_t)0x7FFF;
-#endif
+      sendEnvTelem();
     }
 
-    sendTempReport();
-    sendHumReport(++humSeq);
-  }
+  } else if (rr == 2) {
+    // reserved
 
-  // LED blink
-  static uint32_t lastBlink = 0;
-  if (now - lastBlink > 2000) {
-    lastBlink = now;
-    digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+  } else if (rr == 3) {
+    // RF telem at 500ms
+    if (now - last_rf_ms >= 500) {
+      last_rf_ms = now;
+
+      vbat_raw = analogRead(PIN_VBAT);
+      fwd_raw  = analogRead(PIN_FWD);
+      rev_raw  = analogRead(PIN_REV);
+
+      vswr_state  = calcVswrState(fwd_raw, rev_raw);
+      drive_state = calcDriveState(fwd_raw);
+
+      if (vswr_state == RSCP_VSWR_HIGH) latchErr(RSCP_ERR_VSWR_HIGH);
+
+      sendRfTelem();
+    }
+
+  } else {
+    // LED blink / spare
+    static uint32_t lastBlink = 0;
+    if (now - lastBlink > 2000) {
+      lastBlink = now;
+      digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+    }
   }
 }
