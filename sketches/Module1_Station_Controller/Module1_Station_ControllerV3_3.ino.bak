@@ -75,12 +75,6 @@ uint16_t rotator_deg = 0;
 bool ptt_active = false;
 bool ptt_confirmed = false;
 
-// PTT timing/sequence (used for confirm + latency)
-static uint8_t  ptt_seq = 0;
-static uint32_t ptt_cmd_ms = 0;
-static uint16_t ptt_latency_ms = 0;
-
-
 // Heartbeats
 static uint32_t m2_last_seen_ms = 0;
 static uint32_t m3_last_seen_ms = 0;
@@ -348,6 +342,9 @@ void renderLCD() {
 // ===== PTT =============================================
 // ======================================================
 
+static uint8_t  ptt_seq = 0;
+static uint32_t ptt_cmd_ms = 0;
+static uint16_t ptt_latency_ms = 0;
 
 // Hardware: external 10k pulldown on PIN_PTT_IN, ACTIVE HIGH when pressed
 static inline bool readPttRaw() {

@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------------
-// Module 2: Masthead Protection + PTT (Arduino Nano/Teensy + MCP2515)
+// Module 2: Masthead Protection + PTT (Arduino Nano/Teensy + MCP2515) &&&
 // -----------------------------------------------------------------------------
 // Pin mappings:
 //   LED=4, DHTPIN=8, PSU_Volts=A1, FWD=A2, REV=A3, MCP2515 CS=10
@@ -502,27 +502,27 @@ void loop() {
           rh_pct = rh;
         }
 
-        // DS18 #1 / #2 (optional) — DISABLED BY DEFAULT
-#if ENABLE_DS18B20
-        {
+        // DS18 #1 / #2 (optional)
+        if (ENABLE_DS18B20) {
           bool ok1 = false;
           ds18_1_c_x10 = readDs18_x10(ds18_1, ok1);
           if (!ok1) latchErr(RSCP_ERR_SENSOR_FAIL);
 
-  #if DS18_COUNT == 2
-          bool ok2 = false;
-          ds18_2_c_x10 = readDs18_x10(ds18_2, ok2);
-          if (!ok2) latchErr(RSCP_ERR_SENSOR_FAIL);
-  #else
-          ds18_2_c_x10 = (int16_t)0x7FFF;
-  #endif
-        }
+          // DS18 #2 optional
+
+#if DS18_COUNT == 2
+        bool ok2 = false;
+        ds18_2_c_x10 = readDs18_x10(ds18_2, ok2);
+        if (!ok2) latchErr(RSCP_ERR_SENSOR_FAIL);
 #else
-        ds18_1_c_x10 = (int16_t)0x7FFF;
         ds18_2_c_x10 = (int16_t)0x7FFF;
 #endif
+        } else {
+          ds18_1_c_x10 = (int16_t)0x7FFF;
+          ds18_2_c_x10 = (int16_t)0x7FFF;
+        }
 
-sendEnvTelem();
+      sendEnvTelem();
     }
 
   } else if (rr == 2) {
@@ -553,6 +553,4 @@ sendEnvTelem();
       digitalWrite(PIN_LED, !digitalRead(PIN_LED));
     }
   }
-}
-
 }
