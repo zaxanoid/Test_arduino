@@ -75,19 +75,10 @@ uint16_t rotator_deg = 0;
 bool ptt_active = false;
 bool ptt_confirmed = false;
 
-// PTT timing/sequence (used for confirm + latency)
-static uint8_t  ptt_seq = 0;
-static uint32_t ptt_cmd_ms = 0;
-static uint16_t ptt_latency_ms = 0;
-
-
 // Heartbeats
-static uint32_t m2_last_seen_ms = 0;
-static uint32_t m3_last_seen_ms = 0;
-static uint32_t m4_last_seen_ms = 0;
-static bool alive_m2 = false;
-static bool alive_m3 = false;
-static bool alive_m4 = false;
+bool alive_m2 = false;
+bool alive_m3 = false;
+bool alive_m4 = false;
 
 // CFG ACK status
 uint8_t cfgAckM2 = 0xFF;
@@ -175,6 +166,7 @@ void pushSettingsToRemotes() {
   //sendCfg(RSCP_CFG_STOP_PTT_MASK,     settings.stop_ptt_err_mask);
   sendCfg(RSCP_CFG_STOP_PTT_ERR_MASK, settings.stop_ptt_err_mask);
 
+
   sendCfg(RSCP_CFG_COMPASS_PERIOD_MS, settings.compass_period_ms);
   sendCfg(RSCP_CFG_ROTATOR_PERIOD_MS, settings.rotator_period_ms);
 
@@ -192,108 +184,52 @@ void pushSettingsToRemotes() {
 // ===== CAN RX ==========================================
 // ======================================================
 
-
 void processCan() {
   while (mcp2515.readMessage(&canRx) == MCP2515::ERROR_OK) {
-    const uint16_t id = (uint16_t)(canRx.can_id & 0x7FF);
-
-    // Belt-and-braces "alive": mark M2 alive on ANY recognised M2-origin frame.
-    auto markM2 = [&]() {
-      alive_m2 = true;
-      m2_last_seen_ms = millis();
-    };
-    auto markM3 = [&]() {
-      alive_m3 = true;
-      m3_last_seen_ms = millis();
-    };
-    auto markM4 = [&]() {
-      alive_m4 = true;
-      m4_last_seen_ms = millis();
-    };
-
-    switch (id) {
-
-      case RSCP_ID_BOOT:
-      case RSCP_ID_HEARTBEAT:
-        if (canRx.data[0] == RSCP_NODE_MAST)    markM2();
-        if (canRx.data[0] == RSCP_NODE_COMPASS) markM3();
-        if (canRx.data[0] == RSCP_NODE_ROTATOR) markM4();
-        break;
-
-      case RSCP_ID_STATUS_SUMMARY:
-        if (canRx.data[0] == RSCP_NODE_MAST) {
-          markM2();
-          // optional: canRx.data[1] statusBits
-        }
-        break;
+    switch (canRx.can_id) {
 
       case RSCP_ID_ENV_TELEM:
         mast.temp_x10  = (int16_t)rscp_get_u16(&canRx.data[0]);
+
         mast.humidity  = canRx.data[2];
-        markM2();
+        alive_m2 = true;
         break;
 
       case RSCP_ID_RF_TELEM:
         mast.vbat_raw   = rscp_get_u16(&canRx.data[0]);
-        mast.vswr_state = canRx.data[6]; // per header: drive_state then vswr_state in last bytes? (depends). Keep legacy below.
-        mast.drive_state= canRx.data[6]; // placeholder, your original used [2],[3]; keep original mapping:
         mast.vswr_state = canRx.data[2];
         mast.drive_state= canRx.data[3];
-        markM2();
         break;
-
-      case RSCP_ID_PTT_STATUS: {
-        // M2 confirms switching here.
-        bool state_on   = (canRx.data[0] == RSCP_PTT_ON);
-        uint8_t seq     = canRx.data[1];
-        bool confirmed  = (canRx.data[2] & 0x01) != 0;
-
-        markM2();
-
-        if (state_on && confirmed) {
-          // Only treat as confirmed ON when mast says confirmed.
-          ptt_confirmed = true;
-          if (ptt_active && seq == ptt_seq && ptt_latency_ms == 0) {
-            ptt_latency_ms = (uint16_t)min((uint32_t)(millis() - ptt_cmd_ms), (uint32_t)65535UL);
-          }
-        }
-        if (!state_on) {
-          ptt_confirmed = false;
-        }
-      } break;
 
       case RSCP_ID_HEADING:
         compass_deg = rscp_get_u16(&canRx.data[0]);
-        markM3();
+        alive_m3 = true;
         break;
 
       case RSCP_ID_ROT_STATUS:
-        rotator_deg = rscp_get_u16(&canRx.data[0]);
-        markM4();
+        rotator_deg = rotator_deg = rscp_get_u16(&canRx.data[0]);
+        alive_m4 = true;
         break;
 
       case RSCP_ID_CFG_ACK:
-        if (canRx.data[0] == RSCP_NODE_MAST)    cfgAckM2 = canRx.data[1];
-        if (canRx.data[0] == RSCP_NODE_COMPASS) cfgAckM3 = canRx.data[1];
-        if (canRx.data[0] == RSCP_NODE_ROTATOR) cfgAckM4 = canRx.data[1];
+        if (canRx.data[0] == RSCP_MOD_MAST)    cfgAckM2 = canRx.data[1];
+        if (canRx.data[0] == RSCP_MOD_COMPASS) cfgAckM3 = canRx.data[1];
+        if (canRx.data[0] == RSCP_MOD_ROTATOR) cfgAckM4 = canRx.data[1];
+
         break;
     }
   }
-
-  // Timeout tracking
-  const uint32_t now = millis();
-  const uint32_t timeout_ms = 12000UL;
-  if (alive_m2 && (now - m2_last_seen_ms) > timeout_ms) alive_m2 = false;
-  if (alive_m3 && (now - m3_last_seen_ms) > timeout_ms) alive_m3 = false;
-  if (alive_m4 && (now - m4_last_seen_ms) > timeout_ms) alive_m4 = false;
 }
-
 
 // ======================================================
 // ===== UI ==============================================
 // ======================================================
 
 void renderLCD() {
+  const uint32_t now = millis();
+  const bool rfStale = (now - lastRfMs) > 4000UL;  // no RF telem in 4s
+  const bool envStale = (now - lastEnvMs) > 6000UL; // no ENV telem in 6s
+
   lcd.setCursor(0,0);
   lcd.print("VSWR:");
   lcd.print(vswrText(mast.vswr_state));
@@ -317,84 +253,40 @@ void renderLCD() {
 
   lcd.setCursor(0,3);
   lcd.print("PTT:");
-  if (!ptt_active) {
-    lcd.print("OFF ");
-  } else if (!ptt_confirmed) {
-    lcd.print("REQ ");
-  } else {
-    lcd.print("ON  ");
-  }
-  lcd.print("Lat:");
-  if (ptt_confirmed) {
-    lcd.print(ptt_latency_ms);
-    lcd.print("ms ");
-  } else {
-    lcd.print("---- ");
-  }
-  lcd.print("M2:");
-  if (alive_m2) {
-    lcd.print("OK ");
-    uint16_t s = (uint16_t)min((uint32_t)((millis()-m2_last_seen_ms)/1000UL), (uint32_t)999UL);
-    lcd.print(s);
-    lcd.print("s");
-  } else {
-    lcd.print("LOST");
-  }
+  lcd.print(ptt_active ? "ON " : "OFF");
+  lcd.print(" E:");
+  lcd.print(mast.err_flags ? "Y " : "N ");
+  lcd.print(alive_m2 ? "2" : "-");
+  lcd.print(alive_m3 ? "3" : "-");
+  lcd.print(alive_m4 ? "4" : "-");
 #endif
 }
-
 
 // ======================================================
 // ===== PTT =============================================
 // ======================================================
 
-
-// Hardware: external 10k pulldown on PIN_PTT_IN, ACTIVE HIGH when pressed
-static inline bool readPttRaw() {
-  return (digitalRead(PIN_PTT_IN) == HIGH);
-}
-
-static void sendPttCmd(bool on) {
-  ptt_seq++;
-  canTx.can_id  = RSCP_ID_PTT_CMD;
-  canTx.can_dlc = 3;
-  canTx.data[0] = on ? 1 : 0;
-  canTx.data[1] = ptt_seq;
-  canTx.data[2] = 0; // flags (reserved)
-  mcp2515.sendMessage(&canTx);
-
-  // Station should NOT show PTT:ON until mast confirms.
-  ptt_active = on;        // requested state
-  ptt_confirmed = false;  // becomes true on PTT_STATUS confirmed bit
-  if (on) {
-    ptt_cmd_ms = millis();
-    ptt_latency_ms = 0;
-  }
-}
-
 void handlePtt() {
-  // Debounce (fast, low-latency). 10ms default.
-  static bool last_raw = false;
-  static bool stable = false;
-  static uint32_t last_change_ms = 0;
+  bool in = digitalRead(PIN_PTT_IN) == LOW;
 
-  bool raw = readPttRaw();
-  if (raw != last_raw) {
-    last_raw = raw;
-    last_change_ms = millis();
+  if (in && !ptt_active) {
+    canTx.can_id  = RSCP_ID_PTT_CMD;
+    canTx.can_dlc = 1;
+    canTx.data[0] = 1;
+    mcp2515.sendMessage(&canTx);
+    ptt_active = true;
   }
 
-  const uint32_t debounce_ms = 10;
-  if ((millis() - last_change_ms) >= debounce_ms) {
-    if (stable != raw) {
-      stable = raw;
-      sendPttCmd(stable);
-    }
+  if (!in && ptt_active) {
+    canTx.can_id  = RSCP_ID_PTT_CMD;
+    canTx.can_dlc = 1;
+    canTx.data[0] = 0;
+    mcp2515.sendMessage(&canTx);
+    ptt_active = false;
   }
 
-  // Local indicators:
-  digitalWrite(PIN_PTT_LED, ptt_confirmed ? HIGH : LOW); // LED indicates CONFIRMED TX
-  digitalWrite(PIN_PTT_OUT, ptt_active ? HIGH : LOW);    // D4 "PTT enable" follows requested
+  digitalWrite(PIN_PTT_LED, ptt_active);
+  digitalWrite(PIN_PTT_OUT, ptt_confirmed);
 }
 
 // ======================================================
@@ -402,7 +294,7 @@ void handlePtt() {
 // ======================================================
 
 void setup() {
-  pinMode(PIN_PTT_IN, INPUT);  // external pulldown, active HIGH
+  pinMode(PIN_PTT_IN, INPUT_PULLUP);
   pinMode(PIN_PTT_OUT, OUTPUT);
   pinMode(PIN_PTT_LED, OUTPUT);
   pinMode(PIN_BTN, INPUT_PULLUP);

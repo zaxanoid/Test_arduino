@@ -11,7 +11,7 @@
 
 // ------------------------- Protocol version
 #define RSCP_PROTO_VER_MAJOR 1
-#define RSCP_PROTO_VER_MINOR 5
+#define RSCP_PROTO_VER_MINOR 4
 
 // ------------------------- Module IDs
 enum : uint8_t {
@@ -20,13 +20,6 @@ enum : uint8_t {
   RSCP_MOD_COMPASS = 3,
   RSCP_MOD_ROTATOR = 4
 };
-
-
-// Back-compat aliases (older code used RSCP_MOD_*, newer uses RSCP_NODE_*)
-#define RSCP_NODE_STATION RSCP_MOD_STATION
-#define RSCP_NODE_MAST    RSCP_MOD_MAST
-#define RSCP_NODE_COMPASS RSCP_MOD_COMPASS
-#define RSCP_NODE_ROTATOR RSCP_MOD_ROTATOR
 
 // ------------------------- CAN IDs (11-bit) ---------------------------------
 // Lower ID = higher priority on bus.
@@ -44,7 +37,6 @@ enum : uint16_t {
   // Boot / heartbeat
   RSCP_ID_BOOT               = 0x020, // MODx->STN: data0=module_id, data1=reset_cause, data2=proto_major, data3=proto_minor
   RSCP_ID_HEARTBEAT          = 0x021, // MODx->STN: data0=module_id, data1=flags, data2..5=uptime_s (uint32)
-  RSCP_ID_STATUS_SUMMARY     = 0x022, // MAST->STN: data0=module_id, data1=statusBits, data2=faultCode, data3=faultDetail, data4..5=vbat_raw, data6=reserved, data7=reserved, // MODx->STN: data0=module_id, data1=flags, data2..5=uptime_s (uint32)
 
   // Mast telemetry
   RSCP_ID_ENV_TELEM          = 0x030, // MAST->STN: temp_c_x10(int16), rh_pct(uint8), ds18_c_x10(int16) or 0x7FFF if n/a
@@ -84,14 +76,16 @@ enum : uint8_t {
 enum : uint8_t {
   RSCP_VSWR_OK   = 0,
   RSCP_VSWR_HIGH = 1,
-  RSCP_VSWR_ERR  = 2
+  RSCP_VSWR_ERR  = 2,
+  RSCP_VSWR_NA   = 3
 };
 
 // ------------------------- Drive state (for 16x2 LCD display)
 enum : uint8_t {
   RSCP_DRIVE_OK   = 0,
   RSCP_DRIVE_LOW  = 1,
-  RSCP_DRIVE_HIGH = 2
+  RSCP_DRIVE_HIGH = 2,
+  RSCP_DRIVE_NA   = 3
 };
 
 // ------------------------- Error bit definitions (err_bits in RSCP_ID_ERR_STATUS)

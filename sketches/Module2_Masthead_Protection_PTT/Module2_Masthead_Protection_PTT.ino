@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 // Pin mappings:
 //   LED=4, DHTPIN=8, PSU_Volts=A1, FWD=A2, REV=A3, MCP2515 CS=10
-//   PTT_OUT=7, PTT_SENSE=6 (sense disabled by default)
+//   PTT_OUT=3, PTT_SENSE=2
 //
 // Defaults requested:
 //   - 1x DHT11 (temp + humidity)
@@ -39,16 +39,15 @@
 // ------------------------- Pins
 static const uint8_t PIN_LED         = 4;
 
-static const uint8_t PIN_DHT = 8;  // DHT11 data (NOT Dallas 1-Wire)  // DHT11 data pin (if USE_DHT11)
+static const uint8_t PIN_DHT         = 8;  // DHT11 data pin (if USE_DHT11)
 
 static const uint8_t PIN_DS18_1      = 7;  // DS18B20 #1 (1-Wire)
 static const uint8_t PIN_DS18_2      = 6;  // DS18B20 #2 (optional, if DS18_COUNT==2)
 
-static const uint8_t PIN_PTT_OUT     = 7;  // masthead PTT output (to relay/opto)
-static const uint8_t PIN_PTT_SENSE   = 6;  // PTT confirm input (optional)
-// >>> PTT CONFIRM DISABLED FOR NOW (ENABLE ONLY WHEN WIRED/TESTED) <<<
-static const bool    PTT_SENSE_ENABLE = false;   // set true to require/use PIN_PTT_SENSE
-static const bool    PTT_SENSE_ACTIVE_LOW = true; // set false if confirm goes HIGH when active
+static const uint8_t PIN_PTT_OUT     = 3;  // masthead PTT output (to relay/opto)
+static const uint8_t PIN_PTT_SENSE   = 2;  // sense line to confirm PTT switched (optional)
+static const bool    PTT_SENSE_ENABLE = true;
+static const bool    PTT_SENSE_ACTIVE_LOW = true;
 
 static const uint8_t PIN_CAN_CS      = 10;
 
@@ -56,9 +55,6 @@ static const uint8_t PIN_CAN_CS      = 10;
 static const uint8_t PIN_VBAT        = A1;
 static const uint8_t PIN_FWD         = A2;
 static const uint8_t PIN_REV         = A3;
-
-// >>> DS18B20 DISABLED FOR NOW (SET TO 1 WHEN SENSOR FITTED ON D9) <<<
-#define ENABLE_DS18B20 0
 
 // OPTIONAL: suppress env sensor reads/telemetry while PTT is ON (RF protection)
 static const bool SUPPRESS_ENV_WHEN_PTT_ON = true;
@@ -72,6 +68,7 @@ static const bool SUPPRESS_ENV_WHEN_PTT_ON = true;
 
 #if USE_DHT12
   #include <Wire.h>
+#include <Adafruit_TCS34725.h>
   static const uint8_t DHT12_ADDR = 0x5C; // common DHT12 I2C address
 #endif
 
@@ -123,8 +120,60 @@ static int16_t  ds18_1_c_x10 = (int16_t)0x7FFF;
 static int16_t  ds18_2_c_x10 = (int16_t)0x7FFF;
 
 static uint16_t vbat_raw = 0, fwd_raw = 0, rev_raw = 0;
-static uint8_t  drive_state = RSCP_DRIVE_OK;
-static uint8_t  vswr_state  = RSCP_VSWR_ERR;
+static uint8_t drive_state = RSCP_DRIVE_NA;
+static uint8_t vswr_state  = RSCP_VSWR_NA;
+// ======================================================
+// ===== DRIVE LEVEL VIA TCS34725 COLOR SENSOR (I2C) =====
+// ======================================================
+// LED being monitored:
+//  - orange: input power low   -> RSCP_DRIVE_LOW
+//  - green : input power normal-> RSCP_DRIVE_OK
+//  - red   : input power high  -> RSCP_DRIVE_HIGH
+//
+// If the sensor is absent/uninitialised or light level too low -> RSCP_DRIVE_NA
+//
+// NOTE: This is a *colour sensor watching an LED*, not RF forward power.
+// It should remain meaningful even with radios disconnected.
+
+#define ENABLE_TCS34725 1   // <<< set to 0 to completely disable the colour sensor >>>
+
+#if ENABLE_TCS34725
+// 50ms integration is usually plenty for an LED.
+static Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+static bool tcs_ok = false;
+static uint32_t last_tcs_ms = 0;
+static const uint16_t TCS_MIN_CLEAR = 50;       // below this => too dark/invalid
+static const uint16_t TCS_POLL_MS   = 200;      // poll LED colour at 5Hz
+
+static uint8_t classifyLedColourToDrive(uint16_t r, uint16_t g, uint16_t b, uint16_t c) {
+  if (c < TCS_MIN_CLEAR) return RSCP_DRIVE_NA;
+
+  // Basic dominance checks (robust for LED colours).
+  if (g > (uint16_t)(r * 12UL / 10UL) && g > (uint16_t)(b * 12UL / 10UL)) return RSCP_DRIVE_OK;   // green
+  if (r > (uint16_t)(g * 12UL / 10UL) && r > (uint16_t)(b * 12UL / 10UL)) {
+    // Could be red or orange; decide based on r:g ratio.
+    // Orange tends to have meaningful green component compared to pure red.
+    if (g > (uint16_t)(r * 4UL / 10UL) && b < (uint16_t)(g * 8UL / 10UL)) return RSCP_DRIVE_LOW;  // orange-ish
+    return RSCP_DRIVE_HIGH; // red
+  }
+  // Fallback: if blue dominates, treat as NA (shouldn't happen for your LED).
+  return RSCP_DRIVE_NA;
+}
+
+static void pollDriveLedColour() {
+  if (!tcs_ok) { drive_state = RSCP_DRIVE_NA; return; }
+
+  const uint32_t now = millis();
+  if ((now - last_tcs_ms) < TCS_POLL_MS) return;
+  last_tcs_ms = now;
+
+  uint16_t r, g, b, c;
+  tcs.getRawData(&r, &g, &b, &c);
+  drive_state = classifyLedColourToDrive(r, g, b, c);
+}
+#endif
+
+
 
 // Timers
 static uint32_t last_env_ms = 0;
@@ -176,21 +225,9 @@ static void canSend8(uint16_t id, const uint8_t d[8]) {
   mcp.sendMessage(&f);
 }
 
-static void sendStatusSummary() {
-  uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
-  d[1] = (ptt_requested ? 0x01 : 0x00);
-  d[2] = 0; // faultCode (reserved)
-  d[3] = 0; // faultDetail
-  rscp_put_u16(&d[4], vbat_raw);
-  d[6] = 0;
-  d[7] = 0;
-  canSend8(RSCP_ID_STATUS_SUMMARY, d);
-}
-
 static void sendHeartbeat() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
+  d[0] = RSCP_MOD_MAST;
   d[1] = (ptt_requested ? 0x01 : 0x00);
   uint32_t up_s = millis() / 1000UL;
   rscp_put_u32(&d[2], up_s);
@@ -199,7 +236,7 @@ static void sendHeartbeat() {
 
 static void sendBoot() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
+  d[0] = RSCP_MOD_MAST;
   d[1] = 0; // reset cause placeholder
   d[2] = RSCP_PROTO_VER_MAJOR;
   d[3] = RSCP_PROTO_VER_MINOR;
@@ -217,7 +254,7 @@ static void sendPttStatus(bool confirmed) {
 
 static void sendErrStatus(uint8_t severity) {
   uint8_t d[8] = {0};
-  d[0] = RSCP_NODE_MAST;
+  d[0] = RSCP_MOD_MAST;
   d[1] = severity;
   rscp_put_u32(&d[2], err_bits);
   canSend8(RSCP_ID_ERR_STATUS, d);
@@ -242,6 +279,7 @@ static void sendEnvTelem() {
 
 static void sendRfTelem() {
   uint8_t d[8] = {0};
+  if (fwd_raw < 5) { vswr_state = RSCP_VSWR_NA; }
   rscp_put_u16(&d[0], vbat_raw);
   rscp_put_u16(&d[2], fwd_raw);
   rscp_put_u16(&d[4], rev_raw);
@@ -347,7 +385,7 @@ static void processCan() {
       case RSCP_ID_ERR_CLEAR:
         if (rx.can_dlc >= 6) {
           uint8_t target = rx.data[0];
-          if (target == RSCP_NODE_MAST || target == 0) {
+          if (target == RSCP_MOD_MAST || target == 0) {
             uint32_t mask = rscp_get_u32(&rx.data[2]);
             clearErrMask(mask);
             sendErrStatus((err_bits == 0) ? RSCP_SEV_INFO : RSCP_SEV_ERROR);
@@ -357,7 +395,7 @@ static void processCan() {
 
       case RSCP_ID_CFG_SET:
         // header: module_id, key, value at data[2..5]
-        if (rx.can_dlc >= 6 && rx.data[0] == RSCP_NODE_MAST) {
+        if (rx.can_dlc >= 6 && rx.data[0] == RSCP_MOD_MAST) {
           uint8_t  key = rx.data[1];
           uint32_t val = rscp_get_u32(&rx.data[2]);
 
@@ -374,7 +412,7 @@ static void processCan() {
 
           // ACK (8 bytes)
           uint8_t d[8] = {0};
-          d[0] = RSCP_NODE_MAST;
+          d[0] = RSCP_MOD_MAST;
           d[1] = key;
           d[2] = 0; // status ok
           canSend8(RSCP_ID_CFG_ACK, d);
@@ -395,13 +433,18 @@ void setup() {
   pinMode(PIN_PTT_OUT, OUTPUT);
   applyPttOut(false);
 
-  pinMode(PIN_PTT_SENSE, PTT_SENSE_ENABLE ? INPUT_PULLUP : INPUT);
+  pinMode(PIN_PTT_SENSE, INPUT_PULLUP);
 
 #if USE_DHT11
   dht.begin();
 #endif
 #if USE_DHT12
   Wire.begin();
+#if ENABLE_TCS34725
+  tcs_ok = tcs.begin();
+  // If sensor isn't present, we keep running; drive_state will report N/A.
+#endif
+
 #endif
 
   ds18_1.setWaitForConversion(true);
@@ -425,6 +468,11 @@ void setup() {
 }
 
 void loop() {
+#if ENABLE_TCS34725
+  // Avoid reading sensor during TX if you ever find it sensitive to RF.
+  if (!ptt_active) { pollDriveLedColour(); }
+#endif
+
   // 1) Always: CAN RX
   processCan();
 
@@ -474,10 +522,6 @@ void loop() {
     // Heartbeat every 1s
     if (now - last_hb_ms >= 1000) { last_hb_ms = now; sendHeartbeat(); }
 
-    // Status summary every 2s (belt-and-braces alive indicator)
-    static uint32_t last_sum_ms = 0;
-    if (now - last_sum_ms >= 2000) { last_sum_ms = now; sendStatusSummary(); }
-
   } else if (rr == 1) {
     // Env sensors every 2s (optional suppress while PTT on)
     if (now - last_env_ms >= 2000) {
@@ -502,27 +546,22 @@ void loop() {
           rh_pct = rh;
         }
 
-        // DS18 #1 / #2 (optional) — DISABLED BY DEFAULT
-#if ENABLE_DS18B20
-        {
-          bool ok1 = false;
-          ds18_1_c_x10 = readDs18_x10(ds18_1, ok1);
-          if (!ok1) latchErr(RSCP_ERR_SENSOR_FAIL);
+        // DS18 #1
+        bool ok1 = false;
+        ds18_1_c_x10 = readDs18_x10(ds18_1, ok1);
+        if (!ok1) latchErr(RSCP_ERR_SENSOR_FAIL);
 
-  #if DS18_COUNT == 2
-          bool ok2 = false;
-          ds18_2_c_x10 = readDs18_x10(ds18_2, ok2);
-          if (!ok2) latchErr(RSCP_ERR_SENSOR_FAIL);
-  #else
-          ds18_2_c_x10 = (int16_t)0x7FFF;
-  #endif
-        }
+        // DS18 #2 optional
+#if DS18_COUNT == 2
+        bool ok2 = false;
+        ds18_2_c_x10 = readDs18_x10(ds18_2, ok2);
+        if (!ok2) latchErr(RSCP_ERR_SENSOR_FAIL);
 #else
-        ds18_1_c_x10 = (int16_t)0x7FFF;
         ds18_2_c_x10 = (int16_t)0x7FFF;
 #endif
+      }
 
-sendEnvTelem();
+      sendEnvTelem();
     }
 
   } else if (rr == 2) {
@@ -553,6 +592,4 @@ sendEnvTelem();
       digitalWrite(PIN_LED, !digitalRead(PIN_LED));
     }
   }
-}
-
 }
