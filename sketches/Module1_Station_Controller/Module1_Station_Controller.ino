@@ -31,6 +31,8 @@ static const uint8_t PIN_PTT_IN   = 3;   // external PTT input
 static const uint8_t PIN_PTT_OUT  = 4;   // PTT confirm output
 static const uint8_t PIN_PTT_LED  = 5;   // PTT status LED
 static const uint8_t PIN_BTN      = 2;   // UI button (pullup)
+static uint32_t lastRfMs  = 0;
+static uint32_t lastEnvMs = 0;
 
 // MCP2515
 static const uint8_t CAN_CS_PIN   = 10;
@@ -193,12 +195,16 @@ void processCan() {
 
         mast.humidity  = canRx.data[2];
         alive_m2 = true;
+        lastEnvMs = millis();
+
         break;
 
       case RSCP_ID_RF_TELEM:
         mast.vbat_raw   = rscp_get_u16(&canRx.data[0]);
         mast.vswr_state = canRx.data[2];
         mast.drive_state= canRx.data[3];
+        lastRfMs = millis();
+
         break;
 
       case RSCP_ID_HEADING:
