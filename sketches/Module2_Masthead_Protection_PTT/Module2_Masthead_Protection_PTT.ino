@@ -1,595 +1,354 @@
 // -----------------------------------------------------------------------------
-// Module 2: Masthead Protection + PTT (Arduino Nano/Teensy + MCP2515)
-// -----------------------------------------------------------------------------
-// Pin mappings:
-//   LED=4, DHTPIN=8, PSU_Volts=A1, FWD=A2, REV=A3, MCP2515 CS=10
-//   PTT_OUT=3, PTT_SENSE=2
+// Module 2: Masthead Protection + PTT
+// CANbus + sensors (VBAT, FWD, REV, DHT, optional TCS34725)
+// Safety: latched errors, fail-safe PTT drop, priority CAN IDs for PTT/emerg
 //
-// Defaults requested:
-//   - 1x DHT11 (temp + humidity)
-//   - 1x DS18B20 (temp)
+// Pin mapping (from your remote_V5.2 intent / earlier versions):
+//   LED=4, DHT=8, PSU_Volts=A1, FWD=A2, REV=A3, MCP2515 CS=10
 //
-// Options:
-//   - Use DHT12 instead of DHT11 (I2C)
-//   - Use 2x DS18B20 (second temp in unused ENV_TELEM bytes [5..6])
-//
-// Protocol: rscp_can_protocol.h (v1.4)
-//   RSCP_ID_ENV_TELEM: temp_c_x10(int16 LE), rh_pct(uint8), ds18_c_x10(int16 LE) or 0x7FFF
+// Notes:
+// - ENABLE_TCS34725 default 0 => compiles without Adafruit library installed.
+// - If you want the colour sensor, set ENABLE_TCS34725=1 and install Adafruit_TCS34725.
 // -----------------------------------------------------------------------------
 
-#include <SPI.h>
-#include <mcp2515.h>
-#include <EEPROM.h>
 #include <Arduino.h>
+#include <SPI.h>
+#include <EEPROM.h>
+#include <mcp2515.h>
+#include <Wire.h>
 
-#include "rscp_can_protocol.h"
+#include <rscp_can_protocol.h>
 
-// ------------------------- Sensor selection (compile-time)
-#define USE_DHT11   1
-#define USE_DHT12   0     // set 1 to use DHT12 (I2C) instead of DHT11
-#define DS18_COUNT  1     // set to 1 or 2
+// ------------------------------- Feature flags ------------------------------
+#define RSCP_USE_DHT
+#define ENABLE_TCS34725 0  // set to 1 if you have Adafruit_TCS34725 library + sensor fitted
+// #define RSCP_SERIAL_DEBUG
 
-#if (USE_DHT11 + USE_DHT12) != 1
-  #error "Select exactly one: USE_DHT11=1 or USE_DHT12=1"
-#endif
-#if (DS18_COUNT < 1) || (DS18_COUNT > 2)
-  #error "DS18_COUNT must be 1 or 2"
-#endif
-
-// ------------------------- Pins
-static const uint8_t PIN_LED         = 4;
-
-static const uint8_t PIN_DHT         = 8;  // DHT11 data pin (if USE_DHT11)
-
-static const uint8_t PIN_DS18_1      = 7;  // DS18B20 #1 (1-Wire)
-static const uint8_t PIN_DS18_2      = 6;  // DS18B20 #2 (optional, if DS18_COUNT==2)
-
-static const uint8_t PIN_PTT_OUT     = 3;  // masthead PTT output (to relay/opto)
-static const uint8_t PIN_PTT_SENSE   = 2;  // sense line to confirm PTT switched (optional)
-static const bool    PTT_SENSE_ENABLE = true;
-static const bool    PTT_SENSE_ACTIVE_LOW = true;
-
-static const uint8_t PIN_CAN_CS      = 10;
-
-// Analog
-static const uint8_t PIN_VBAT        = A1;
-static const uint8_t PIN_FWD         = A2;
-static const uint8_t PIN_REV         = A3;
-
-// OPTIONAL: suppress env sensor reads/telemetry while PTT is ON (RF protection)
-static const bool SUPPRESS_ENV_WHEN_PTT_ON = true;
-
-// ------------------------- DHT
-#if USE_DHT11
+#ifdef RSCP_USE_DHT
   #include <DHT.h>
-  static const uint8_t DHTTYPE = DHT11;
+#endif
+
+#if ENABLE_TCS34725
+  #include <Adafruit_TCS34725.h>
+#endif
+
+// ------------------------------- Pinout -------------------------------------
+static const uint8_t PIN_CAN_CS      = 10; // MCP2515 CS
+
+static const uint8_t PIN_LED_DEBUG   = 4;  // existing LED
+static const uint8_t PIN_PTT_OUT     = 7;  // OUTPUT to opto/relay to key PA/transverter
+
+// Optional confirm input (if you have it wired):
+static const uint8_t PIN_PTT_CONFIRM = 2;  // INPUT confirm TX engaged (LOW = confirmed)
+static const bool    HAVE_PTT_CONFIRM = false; // set true if wired/used
+
+// Sensors
+static const uint8_t PIN_DHT         = 8;  // DHTxx data
+static const uint8_t PIN_VBAT        = A1; // PSU_VolTS ADC
+static const uint8_t PIN_FWD         = A2; // forward power ADC
+static const uint8_t PIN_REV         = A3; // reverse power ADC
+
+// ------------------------------- DHT config ---------------------------------
+#ifdef RSCP_USE_DHT
+  // Change to DHT11 or DHT22 depending on your sensor
+  #define DHTTYPE DHT11
   DHT dht(PIN_DHT, DHTTYPE);
 #endif
 
-#if USE_DHT12
-  #include <Wire.h>
-#include <Adafruit_TCS34725.h>
-  static const uint8_t DHT12_ADDR = 0x5C; // common DHT12 I2C address
+#if ENABLE_TCS34725
+  Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
 #endif
 
-// ------------------------- DS18B20
-#include <OneWire.h>
-#include <DallasTemperature.h>
+// ------------------------------- CAN ----------------------------------------
+MCP2515 mcp2515(PIN_CAN_CS);
+static struct can_frame rx;
+static struct can_frame tx;
 
-static OneWire ow1(PIN_DS18_1);
-static DallasTemperature ds18_1(&ow1);
+// ------------------------------- State --------------------------------------
+static uint8_t  g_ptt_cmd     = RSCP_PTT_OFF;
+static bool     ptt_active    = false; // true when PTT output asserted
 
-#if DS18_COUNT == 2
-static OneWire ow2(PIN_DS18_2);
-static DallasTemperature ds18_2(&ow2);
-#endif
+static uint8_t  g_status_flags = 0;
+static uint32_t g_err_code     = RSCP_ERR_NONE;
 
-// ------------------------- CAN
-MCP2515 mcp(PIN_CAN_CS);
-struct can_frame rx;
+static uint32_t g_last_ptt_rx_ms  = 0;
+static uint32_t g_last_env_ms     = 0;
+static uint32_t g_last_rf_ms      = 0;
 
-// ------------------------- Settings in EEPROM
-struct MastSettings {
-  uint32_t magic;
-  uint32_t stopPttErrMask; // RSCP_ERR_* bitmask
-  uint32_t pttMaxMs;
-  // Threshold placeholders (calibrate later)
-  uint32_t vbat_low_raw;
-  uint32_t vswr1_high_raw;
-  uint32_t vswr2_high_raw;
-  uint32_t temp1_high_x10;
-  uint32_t temp2_high_x10;
-  uint32_t hum_high_pct;
+static uint8_t  g_task_rr      = 0;
+
+// ------------------------------- Settings -----------------------------------
+struct Settings2 {
+  uint32_t ptt_max_ms;
+  uint32_t stop_ptt_err_mask;  // which errors are allowed to stop PTT (bitmask)
 };
 
-static const uint32_t MAST_MAGIC = 0x4D415354; // "MAST"
-MastSettings cfg;
+static Settings2 settings2;
 
-// ------------------------- Runtime state
-static bool     ptt_requested = false;
-static uint8_t  last_ptt_seq = 0;
-static uint32_t ptt_on_ms = 0;
-
-static uint32_t err_bits = 0; // latched
-static bool     err_changed = false;
-
-// Telemetry
-static int16_t  temp_c_x10 = (int16_t)0x7FFF;
-static uint8_t  rh_pct = 0xFF;
-static int16_t  ds18_1_c_x10 = (int16_t)0x7FFF;
-static int16_t  ds18_2_c_x10 = (int16_t)0x7FFF;
-
-static uint16_t vbat_raw = 0, fwd_raw = 0, rev_raw = 0;
-static uint8_t drive_state = RSCP_DRIVE_NA;
-static uint8_t vswr_state  = RSCP_VSWR_NA;
-// ======================================================
-// ===== DRIVE LEVEL VIA TCS34725 COLOR SENSOR (I2C) =====
-// ======================================================
-// LED being monitored:
-//  - orange: input power low   -> RSCP_DRIVE_LOW
-//  - green : input power normal-> RSCP_DRIVE_OK
-//  - red   : input power high  -> RSCP_DRIVE_HIGH
-//
-// If the sensor is absent/uninitialised or light level too low -> RSCP_DRIVE_NA
-//
-// NOTE: This is a *colour sensor watching an LED*, not RF forward power.
-// It should remain meaningful even with radios disconnected.
-
-#define ENABLE_TCS34725 1   // <<< set to 0 to completely disable the colour sensor >>>
-
-#if ENABLE_TCS34725
-// 50ms integration is usually plenty for an LED.
-static Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
-static bool tcs_ok = false;
-static uint32_t last_tcs_ms = 0;
-static const uint16_t TCS_MIN_CLEAR = 50;       // below this => too dark/invalid
-static const uint16_t TCS_POLL_MS   = 200;      // poll LED colour at 5Hz
-
-static uint8_t classifyLedColourToDrive(uint16_t r, uint16_t g, uint16_t b, uint16_t c) {
-  if (c < TCS_MIN_CLEAR) return RSCP_DRIVE_NA;
-
-  // Basic dominance checks (robust for LED colours).
-  if (g > (uint16_t)(r * 12UL / 10UL) && g > (uint16_t)(b * 12UL / 10UL)) return RSCP_DRIVE_OK;   // green
-  if (r > (uint16_t)(g * 12UL / 10UL) && r > (uint16_t)(b * 12UL / 10UL)) {
-    // Could be red or orange; decide based on r:g ratio.
-    // Orange tends to have meaningful green component compared to pure red.
-    if (g > (uint16_t)(r * 4UL / 10UL) && b < (uint16_t)(g * 8UL / 10UL)) return RSCP_DRIVE_LOW;  // orange-ish
-    return RSCP_DRIVE_HIGH; // red
-  }
-  // Fallback: if blue dominates, treat as NA (shouldn't happen for your LED).
-  return RSCP_DRIVE_NA;
+// ------------------------------- Helpers ------------------------------------
+static inline void canSend(uint16_t can_id, const uint8_t *d, uint8_t len) {
+  tx.can_id  = can_id;
+  tx.can_dlc = len;
+  for (uint8_t i = 0; i < len; i++) tx.data[i] = d[i];
+  mcp2515.sendMessage(&tx);
 }
 
-static void pollDriveLedColour() {
-  if (!tcs_ok) { drive_state = RSCP_DRIVE_NA; return; }
-
-  const uint32_t now = millis();
-  if ((now - last_tcs_ms) < TCS_POLL_MS) return;
-  last_tcs_ms = now;
-
-  uint16_t r, g, b, c;
-  tcs.getRawData(&r, &g, &b, &c);
-  drive_state = classifyLedColourToDrive(r, g, b, c);
-}
-#endif
-
-
-
-// Timers
-static uint32_t last_env_ms = 0;
-static uint32_t last_rf_ms  = 0;
-static uint32_t last_hb_ms  = 0;
-
-// ------------------------- Helpers
-static void loadCfg() {
-  EEPROM.get(0, cfg);
-  if (cfg.magic != MAST_MAGIC) {
-    cfg.magic = MAST_MAGIC;
-    cfg.stopPttErrMask = (RSCP_ERR_PTT_FAIL | RSCP_ERR_VSWR_HIGH | RSCP_ERR_OVERTIME);
-    cfg.pttMaxMs = 300000UL;
-
-    cfg.vbat_low_raw   = 0;
-    cfg.vswr1_high_raw = 0;
-    cfg.vswr2_high_raw = 0;
-    cfg.temp1_high_x10 = 0;
-    cfg.temp2_high_x10 = 0;
-    cfg.hum_high_pct   = 0;
-
-    EEPROM.put(0, cfg);
-  }
-}
-
-static void latchErr(uint32_t bit) {
-  if ((err_bits & bit) == 0) {
-    err_bits |= bit;
-    err_changed = true;
-  }
-}
-
-static void clearErrMask(uint32_t mask) {
-  if (mask == 0xFFFFFFFFUL) {
-    if (err_bits != 0) err_changed = true;
-    err_bits = 0;
-  } else {
-    uint32_t before = err_bits;
-    err_bits &= ~mask;
-    if (err_bits != before) err_changed = true;
-  }
-}
-
-static void canSend8(uint16_t id, const uint8_t d[8]) {
-  struct can_frame f{};
-  f.can_id  = id;
-  f.can_dlc = 8;
-  for (uint8_t i = 0; i < 8; i++) f.data[i] = d[i];
-  mcp.sendMessage(&f);
+static void sendBoot() {
+  uint8_t d[8] = {0};
+  d[0] = RSCP_PROTO_VER_MAJOR;
+  d[1] = RSCP_PROTO_VER_MINOR;
+  d[2] = RSCP_MOD_MAST;
+  d[3] = 0; // reset reason placeholder
+  canSend(RSCP_ID_BOOT, d, 8);
 }
 
 static void sendHeartbeat() {
   uint8_t d[8] = {0};
   d[0] = RSCP_MOD_MAST;
-  d[1] = (ptt_requested ? 0x01 : 0x00);
-  uint32_t up_s = millis() / 1000UL;
-  rscp_put_u32(&d[2], up_s);
-  canSend8(RSCP_ID_HEARTBEAT, d);
+  d[1] = (uint8_t)(ptt_active ? 1 : 0);
+  d[2] = (uint8_t)(g_err_code != RSCP_ERR_NONE ? 1 : 0);
+  canSend(RSCP_ID_HEARTBEAT, d, 8);
 }
 
-static void sendBoot() {
+static bool pttConfirmActive() {
+  if (!HAVE_PTT_CONFIRM) return true;
+  // LOW means confirmed
+  return (digitalRead(PIN_PTT_CONFIRM) == LOW);
+}
+
+static void sendPttStatus() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_MOD_MAST;
-  d[1] = 0; // reset cause placeholder
-  d[2] = RSCP_PROTO_VER_MAJOR;
-  d[3] = RSCP_PROTO_VER_MINOR;
-  canSend8(RSCP_ID_BOOT, d);
+  d[0] = (uint8_t)(ptt_active ? RSCP_PTT_ON : RSCP_PTT_OFF);
+  d[1] = (uint8_t)(g_status_flags);
+  d[2] = (uint8_t)(g_err_code != RSCP_ERR_NONE ? 1 : 0);
+  d[3] = RSCP_MOD_MAST;
+  canSend(RSCP_ID_PTT_STATUS, d, 8);
 }
 
-static void sendPttStatus(bool confirmed) {
-  uint8_t d[8] = {0};
-  d[0] = ptt_requested ? RSCP_PTT_ON : RSCP_PTT_OFF;
-  d[1] = last_ptt_seq;
-  d[2] = confirmed ? 0x01 : 0x00;        // status_flags bit0=confirmed
-  d[3] = (err_bits != 0) ? 1 : 0;         // err_latched flag
-  canSend8(RSCP_ID_PTT_STATUS, d);
+static void latchError(uint32_t err_code) {
+  if (g_err_code == RSCP_ERR_NONE) {
+    g_err_code = err_code;
+  }
 }
 
-static void sendErrStatus(uint8_t severity) {
-  uint8_t d[8] = {0};
-  d[0] = RSCP_MOD_MAST;
-  d[1] = severity;
-  rscp_put_u32(&d[2], err_bits);
-  canSend8(RSCP_ID_ERR_STATUS, d);
+static void clearErrorManual() {
+  g_err_code = RSCP_ERR_NONE;
 }
 
+static void applyPtt(uint8_t want_on) {
+  if (want_on) {
+    // If latched error exists, inhibit
+    if (g_err_code != RSCP_ERR_NONE) {
+      g_status_flags |= RSCP_PTTSTAT_INHIBITED;
+      g_ptt_cmd = RSCP_PTT_OFF;
+      ptt_active = false;
+      digitalWrite(PIN_PTT_OUT, LOW);
+      sendPttStatus();
+      return;
+    }
+
+    // engage
+    g_ptt_cmd = RSCP_PTT_ON;
+    ptt_active = true;
+    digitalWrite(PIN_PTT_OUT, HIGH);
+
+    // confirm if available
+    if (pttConfirmActive()) g_status_flags |= RSCP_PTTSTAT_CONFIRMED;
+    else g_status_flags &= ~RSCP_PTTSTAT_CONFIRMED;
+
+    sendPttStatus();
+  } else {
+    g_ptt_cmd = RSCP_PTT_OFF;
+    ptt_active = false;
+    digitalWrite(PIN_PTT_OUT, LOW);
+    g_status_flags &= ~(RSCP_PTTSTAT_CONFIRMED | RSCP_PTTSTAT_INHIBITED);
+    sendPttStatus();
+  }
+}
+
+// ------------------------------- Telemetry ---------------------------------
 static void sendEnvTelem() {
-  // RSCP_ID_ENV_TELEM (header-defined fields):
-  //   [0..1] temp_c_x10 (int16)
-  //   [2]    rh_pct (uint8)
-  //   [3..4] ds18_c_x10 (int16) or 0x7FFF
-  // Additional (safe): [5..6] ds18_2_c_x10 (int16) if present, else 0x7FFF
   uint8_t d[8] = {0};
 
-  rscp_put_i16(&d[0], temp_c_x10);
-  d[2] = rh_pct;
-  rscp_put_i16(&d[3], ds18_1_c_x10);
-  rscp_put_i16(&d[5], ds18_2_c_x10);
-  d[7] = 0;
+#ifdef RSCP_USE_DHT
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (!isnan(t)) {
+    int16_t tx10 = (int16_t)(t * 10.0f);
+    rscp_put_u16(&d[0], (uint16_t)tx10);
+  }
+  if (!isnan(h)) {
+    d[2] = (uint8_t)(h + 0.5f);
+  }
+#else
+  rscp_put_u16(&d[0], 0);
+  d[2] = 0;
+#endif
 
-  canSend8(RSCP_ID_ENV_TELEM, d);
+  d[3] = 0; // status flags placeholder
+  d[7] = RSCP_MOD_MAST;
+
+  canSend(RSCP_ID_ENV_TELEM, d, 8);
+  g_last_env_ms = millis();
 }
 
 static void sendRfTelem() {
   uint8_t d[8] = {0};
-  if (fwd_raw < 5) { vswr_state = RSCP_VSWR_NA; }
-  rscp_put_u16(&d[0], vbat_raw);
-  rscp_put_u16(&d[2], fwd_raw);
-  rscp_put_u16(&d[4], rev_raw);
-  d[6] = drive_state;
-  d[7] = vswr_state;
-  canSend8(RSCP_ID_RF_TELEM, d);
+
+  uint16_t vraw = (uint16_t)analogRead(PIN_VBAT);
+  uint16_t fwd  = (uint16_t)analogRead(PIN_FWD);
+  uint16_t rev  = (uint16_t)analogRead(PIN_REV);
+
+  rscp_put_u16(&d[0], vraw);
+  d[2] = 0; // VSWR state placeholder (0 OK, 1 High, 2 ERR)
+  d[3] = 0; // Drive state placeholder (0 OK, 1 Low, 2 High)
+
+  // pack raw fwd/rev if you want later (currently spare)
+  (void)fwd; (void)rev;
+
+  d[7] = RSCP_MOD_MAST;
+
+  canSend(RSCP_ID_RF_TELEM, d, 8);
+  g_last_rf_ms = millis();
 }
 
-// Placeholder VSWR calc (calibrate later)
-static uint8_t calcVswrState(uint16_t fwd, uint16_t rev) {
-  if (fwd == 0 && rev == 0) return RSCP_VSWR_ERR;
-  if (rev > (fwd / 2)) return RSCP_VSWR_HIGH;
-  return RSCP_VSWR_OK;
+// ------------------------------- Settings RX -------------------------------
+static void sendCfgAck(uint8_t key, uint8_t status) {
+  uint8_t d[8] = {0};
+  d[0] = RSCP_MOD_MAST;
+  d[1] = status;   // 0 OK, E nonzero for error (your convention)
+  d[2] = key;
+  canSend(RSCP_ID_CFG_ACK, d, 8);
 }
 
-static uint8_t calcDriveState(uint16_t fwd) {
-  if (fwd < 50) return RSCP_DRIVE_LOW;
-  if (fwd > 800) return RSCP_DRIVE_HIGH;
-  return RSCP_DRIVE_OK;
-}
-
-static bool pttConfirmedNow() {
-  if (!PTT_SENSE_ENABLE) return true;
-  bool s = digitalRead(PIN_PTT_SENSE);
-  return PTT_SENSE_ACTIVE_LOW ? (s == LOW) : (s == HIGH);
-}
-
-static void applyPttOut(bool on) {
-  digitalWrite(PIN_PTT_OUT, on ? HIGH : LOW);
-}
-
-// ------------------------- Sensor reading
-static bool readDht_x10(int16_t &t10, uint8_t &rh) {
-#if USE_DHT11
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
-  if (isnan(t) || isnan(h)) return false;
-
-  t10 = (int16_t)(t * 10.0f);
-  int hi = (int)(h + 0.5f);
-  if (hi < 0) hi = 0;
-  if (hi > 100) hi = 100;
-  rh = (uint8_t)hi;
-  return true;
-#endif
-
-#if USE_DHT12
-  // Read 5 bytes: hum_int, hum_dec, temp_int, temp_dec+sign, checksum
-  Wire.beginTransmission(DHT12_ADDR);
-  Wire.write((uint8_t)0x00);
-  if (Wire.endTransmission(false) != 0) return false;
-
-  uint8_t n = Wire.requestFrom((int)DHT12_ADDR, 5);
-  if (n != 5) return false;
-
-  uint8_t b[5];
-  for (uint8_t i = 0; i < 5; i++) b[i] = Wire.read();
-
-  uint8_t sum = (uint8_t)(b[0] + b[1] + b[2] + b[3]);
-  if (sum != b[4]) return false;
-
-  rh = b[0];
-
-  int16_t temp10 = (int16_t)(b[2] * 10 + (b[3] & 0x7F));
-  if (b[3] & 0x80) temp10 = -temp10;
-  t10 = temp10;
-  return true;
-#endif
-}
-
-static int16_t readDs18_x10(DallasTemperature &bus, bool &ok) {
-  ok = false;
-  bus.requestTemperatures();
-  float t = bus.getTempCByIndex(0);
-  if (t == DEVICE_DISCONNECTED_C) return (int16_t)0x7FFF;
-  ok = true;
-  return (int16_t)(t * 10.0f);
-}
-
-// ------------------------- CAN RX
-static void processCan() {
-  while (mcp.readMessage(&rx) == MCP2515::ERROR_OK) {
-    uint16_t id = (uint16_t)(rx.can_id & 0x7FF);
-
-    switch (id) {
-      case RSCP_ID_EMERG_PTT_OFF:
-        ptt_requested = false;
-        applyPttOut(false);
-        sendPttStatus(false);
-        break;
-
-      case RSCP_ID_PTT_CMD:
-        if (rx.can_dlc >= 2) {
-          bool on = rx.data[0] != 0;
-          last_ptt_seq = rx.data[1];
-          ptt_requested = on;
-          if (on) ptt_on_ms = millis();
-          applyPttOut(on);
-          // confirm check happens in main loop
-        }
-        break;
-
-      case RSCP_ID_ERR_CLEAR:
-        if (rx.can_dlc >= 6) {
-          uint8_t target = rx.data[0];
-          if (target == RSCP_MOD_MAST || target == 0) {
-            uint32_t mask = rscp_get_u32(&rx.data[2]);
-            clearErrMask(mask);
-            sendErrStatus((err_bits == 0) ? RSCP_SEV_INFO : RSCP_SEV_ERROR);
-          }
-        }
-        break;
-
-      case RSCP_ID_CFG_SET:
-        // header: module_id, key, value at data[2..5]
-        if (rx.can_dlc >= 6 && rx.data[0] == RSCP_MOD_MAST) {
-          uint8_t  key = rx.data[1];
-          uint32_t val = rscp_get_u32(&rx.data[2]);
-
-          if      (key == RSCP_CFG_PTT_MAX_MS)        cfg.pttMaxMs = val;
-          else if (key == RSCP_CFG_STOP_PTT_ERR_MASK) cfg.stopPttErrMask = val;
-          else if (key == RSCP_CFG_VBAT_LOW_RAW)      cfg.vbat_low_raw = val;
-          else if (key == RSCP_CFG_VSWR1_HIGH_RAW)    cfg.vswr1_high_raw = val;
-          else if (key == RSCP_CFG_VSWR2_HIGH_RAW)    cfg.vswr2_high_raw = val;
-          else if (key == RSCP_CFG_TEMP1_HIGH_X10)    cfg.temp1_high_x10 = val;
-          else if (key == RSCP_CFG_TEMP2_HIGH_X10)    cfg.temp2_high_x10 = val;
-          else if (key == RSCP_CFG_HUM_HIGH_PCT)      cfg.hum_high_pct = val;
-
-          EEPROM.put(0, cfg);
-
-          // ACK (8 bytes)
-          uint8_t d[8] = {0};
-          d[0] = RSCP_MOD_MAST;
-          d[1] = key;
-          d[2] = 0; // status ok
-          canSend8(RSCP_ID_CFG_ACK, d);
-        }
-        break;
-
-      default:
-        break;
-    }
+static void loadSettings() {
+  EEPROM.get(0, settings2);
+  if (settings2.ptt_max_ms == 0xFFFFFFFFUL || settings2.ptt_max_ms == 0) {
+    settings2.ptt_max_ms = 300000UL;
+    settings2.stop_ptt_err_mask = 0xFFFFFFFFUL;
+    EEPROM.put(0, settings2);
   }
 }
 
-// ------------------------- Setup / Loop
+static void handleCfgSet(const struct can_frame &f) {
+  const uint8_t key = f.data[0];
+  const uint32_t val = rscp_le_to_u32(&f.data[4]);
+
+  switch (key) {
+    case RSCP_CFG_PTT_MAX_MS:
+      settings2.ptt_max_ms = val;
+      EEPROM.put(0, settings2);
+      sendCfgAck(key, 0);
+      break;
+
+    case RSCP_CFG_STOP_PTT_ERR_MASK:
+      settings2.stop_ptt_err_mask = val;
+      EEPROM.put(0, settings2);
+      sendCfgAck(key, 0);
+      break;
+
+    default:
+      // ignore unknown keys but ACK with error
+      sendCfgAck(key, 1);
+      break;
+  }
+}
+
+// ------------------------------- CAN RX -------------------------------------
+static void handleCan(const struct can_frame &f) {
+  if (f.can_id == RSCP_ID_EMERG_PTT_OFF) {
+    applyPtt(0);
+    return;
+  }
+
+  if (f.can_id == RSCP_ID_PTT_CMD) {
+    const uint8_t want = f.data[0] ? 1 : 0;
+    g_last_ptt_rx_ms = millis();
+    applyPtt(want);
+    return;
+  }
+
+  if (f.can_id == RSCP_ID_ERR_CLEAR) {
+    // Manual clear only, no auto-clear
+    clearErrorManual();
+    sendPttStatus();
+    return;
+  }
+
+  if (f.can_id == RSCP_ID_CFG_SET) {
+    handleCfgSet(f);
+    return;
+  }
+}
+
+// ------------------------------- Tasks --------------------------------------
+static void pollColourSensorTick() {
+#if ENABLE_TCS34725
+  // Only poll when not transmitting (RF)
+  if (ptt_active) return;
+
+  static uint32_t last = 0;
+  const uint32_t now = millis();
+  if ((now - last) < 1000UL) return;
+  last = now;
+
+  uint16_t r, g, b, c;
+  tcs.getRawData(&r, &g, &b, &c);
+  // TODO: implement LED colour/status decoding
+  (void)r; (void)g; (void)b; (void)c;
+#endif
+}
+
+static void runOneTask() {
+  switch (g_task_rr++ & 0x03) {
+    case 0: sendEnvTelem(); break;
+    case 1: sendRfTelem();  break;
+    case 2: sendHeartbeat(); break;
+    case 3: pollColourSensorTick(); break;
+  }
+}
+
+// ------------------------------- Setup/Loop ---------------------------------
 void setup() {
-  pinMode(PIN_LED, OUTPUT);
-  digitalWrite(PIN_LED, HIGH);
-
+  pinMode(PIN_LED_DEBUG, OUTPUT);
   pinMode(PIN_PTT_OUT, OUTPUT);
-  applyPttOut(false);
+  digitalWrite(PIN_PTT_OUT, LOW);
 
-  pinMode(PIN_PTT_SENSE, INPUT_PULLUP);
+  if (HAVE_PTT_CONFIRM) pinMode(PIN_PTT_CONFIRM, INPUT_PULLUP);
 
-#if USE_DHT11
+#ifdef RSCP_USE_DHT
   dht.begin();
 #endif
-#if USE_DHT12
-  Wire.begin();
+
 #if ENABLE_TCS34725
-  tcs_ok = tcs.begin();
-  // If sensor isn't present, we keep running; drive_state will report N/A.
+  // If sensor init fails, just disable polling by leaving ENABLE_TCS34725 at 0 in code
+  tcs.begin();
 #endif
 
-#endif
+  SPI.begin();
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_500KBPS);
+  mcp2515.setNormalMode();
 
-  ds18_1.setWaitForConversion(true);
-  ds18_1.begin();
-#if DS18_COUNT == 2
-  ds18_2.setWaitForConversion(true);
-  ds18_2.begin();
-#endif
-
-  loadCfg();
-
-  mcp.reset();
-  // NOTE: set MCP_8MHZ vs MCP_16MHZ to match your module crystal
-  mcp.setBitrate(CAN_500KBPS, MCP_8MHZ);
-  mcp.setNormalMode();
-
-  delay(20);
+  loadSettings();
   sendBoot();
-
-  digitalWrite(PIN_LED, LOW);
 }
 
 void loop() {
-#if ENABLE_TCS34725
-  // Avoid reading sensor during TX if you ever find it sensitive to RF.
-  if (!ptt_active) { pollDriveLedColour(); }
-#endif
-
-  // 1) Always: CAN RX
-  processCan();
-
-  // 2) Always: PTT safety evaluation
-  bool confirmed = pttConfirmedNow();
-
-  // Overtime protection
-  if (ptt_requested && cfg.pttMaxMs > 0 && (millis() - ptt_on_ms > cfg.pttMaxMs)) {
-    latchErr(RSCP_ERR_OVERTIME);
-    ptt_requested = false;
-    applyPttOut(false);
+  // Priority: drain CAN RX every loop
+  while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
+    handleCan(rx);
   }
 
-  // Sense/confirm failure
-  if (ptt_requested && PTT_SENSE_ENABLE && !confirmed) {
-    latchErr(RSCP_ERR_PTT_FAIL);
-    ptt_requested = false;
-    applyPttOut(false);
-  }
-
-  // If any configured STOP errors are set, drop PTT
-  if (ptt_requested && (err_bits & cfg.stopPttErrMask)) {
-    ptt_requested = false;
-    applyPttOut(false);
-  }
-
-  // Push immediate error status if changed
-  if (err_changed) {
-    err_changed = false;
-    sendErrStatus((err_bits & cfg.stopPttErrMask) ? RSCP_SEV_FATAL : RSCP_SEV_ERROR);
-  }
-
-  // Report PTT status on state changes only
-  static bool prev_ptt = false;
-  if (ptt_requested != prev_ptt) {
-    prev_ptt = ptt_requested;
-    sendPttStatus(confirmed && ptt_requested);
-  }
-
-  // 3) Cooperative scheduler: one non-PTT task per loop
-  static uint8_t rr = 0;
-  rr = (rr + 1) % 5;
-
-  uint32_t now = millis();
-
-  if (rr == 0) {
-    // Heartbeat every 1s
-    if (now - last_hb_ms >= 1000) { last_hb_ms = now; sendHeartbeat(); }
-
-  } else if (rr == 1) {
-    // Env sensors every 2s (optional suppress while PTT on)
-    if (now - last_env_ms >= 2000) {
-      last_env_ms = now;
-
-      if (SUPPRESS_ENV_WHEN_PTT_ON && ptt_requested) {
-        // mark invalid + don't spam errors due to RF
-        temp_c_x10 = (int16_t)0x7FFF;
-        rh_pct = 0xFF;
-        ds18_1_c_x10 = (int16_t)0x7FFF;
-        ds18_2_c_x10 = (int16_t)0x7FFF;
-      } else {
-        // DHT
-        int16_t t10;
-        uint8_t rh;
-        if (!readDht_x10(t10, rh)) {
-          latchErr(RSCP_ERR_SENSOR_FAIL);
-          temp_c_x10 = (int16_t)0x7FFF;
-          rh_pct = 0xFF;
-        } else {
-          temp_c_x10 = t10;
-          rh_pct = rh;
-        }
-
-        // DS18 #1
-        bool ok1 = false;
-        ds18_1_c_x10 = readDs18_x10(ds18_1, ok1);
-        if (!ok1) latchErr(RSCP_ERR_SENSOR_FAIL);
-
-        // DS18 #2 optional
-#if DS18_COUNT == 2
-        bool ok2 = false;
-        ds18_2_c_x10 = readDs18_x10(ds18_2, ok2);
-        if (!ok2) latchErr(RSCP_ERR_SENSOR_FAIL);
-#else
-        ds18_2_c_x10 = (int16_t)0x7FFF;
-#endif
-      }
-
-      sendEnvTelem();
-    }
-
-  } else if (rr == 2) {
-    // reserved
-
-  } else if (rr == 3) {
-    // RF telem at 500ms
-    if (now - last_rf_ms >= 500) {
-      last_rf_ms = now;
-
-      vbat_raw = analogRead(PIN_VBAT);
-      fwd_raw  = analogRead(PIN_FWD);
-      rev_raw  = analogRead(PIN_REV);
-
-      vswr_state  = calcVswrState(fwd_raw, rev_raw);
-      drive_state = calcDriveState(fwd_raw);
-
-      if (vswr_state == RSCP_VSWR_HIGH) latchErr(RSCP_ERR_VSWR_HIGH);
-
-      sendRfTelem();
-    }
-
-  } else {
-    // LED blink / spare
-    static uint32_t lastBlink = 0;
-    if (now - lastBlink > 2000) {
-      lastBlink = now;
-      digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+  // Priority: PTT overtime protection (drop PTT if stuck too long)
+  if (ptt_active) {
+    const uint32_t now = millis();
+    if (settings2.ptt_max_ms > 0 && (now - g_last_ptt_rx_ms) > settings2.ptt_max_ms) {
+      latchError(RSCP_ERR_PTT_OVERTIME);
+      applyPtt(0);
     }
   }
+
+  // Deterministic loop: run at most one extra task per iteration
+  runOneTask();
 }
