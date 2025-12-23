@@ -1,4 +1,19 @@
 Remote station controller project
+code and docs to be kept on GitHub, you have access:
+
+https://github.com/zaxanoid/Test_arduino
+Repo layout:
+Test_arduino/
+  libraries/
+    RSCP/                 (the Arduino library)
+  sketches/
+    Module1_Station/
+    Module2_Mast/
+    Module3_Compass/
+    Module4_Rotator/
+  README.md
+  docs/
+
 
 This project has a purpose:  the idea /concept is a modular system where parts can be added as needed, to a starting point of a station controller "module 1" which will be near/next to the operator and the radios
 All modules will use a hardware timer (and feed it frequently to prevent accidental trigger), which will perform a reset of the module in the event of a "crash". When they boot or reboot they will signal this (via CANBUS) to the station. The station will be able to display this information, and also any reboots it has had.
@@ -61,7 +76,7 @@ May use Arduino nano or Pi Pico
 
 Notes:
 The project is at https://github.com/zaxanoid/Test_arduino
-Suggested repo layout:
+Repo layout:
 Test_arduino/
   libraries/
     RSCP/                 (the Arduino library)
