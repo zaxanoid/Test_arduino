@@ -1,0 +1,131 @@
+Remote station controller project
+
+This project has a purpose:  the idea /concept is a modular system where parts can be added as needed, to a starting point of a station controller "module 1" which will be near/next to the operator and the radios
+All modules will use a hardware timer (and feed it frequently to prevent accidental trigger), which will perform a reset of the module in the event of a "crash". When they boot or reboot they will signal this (via CANBUS) to the station. The station will be able to display this information, and also any reboots it has had.
+All coding will be done in C using Arduino environment (unless there is a big issue with something  - perhaps interrupts?  - where I MAY consider an alternative)
+
+Module 1
+(The station controller)
+This will have:
+a screen and possibly a few LEDs for outputs, to show remote status of things like VSWR, power, antenna compass bearing, PTT status, any error conditions, temperature, humidity, heartbeat from all remote parts, voltage(s), and (via colour sensor) the status of remote LED(s) for RF Drive level on input
+
+Ideally the MAIN information will be always on screen. Possibly a push switch to show a second "screen" of information.
+Ideally we can support 16x2 LCD, 20x4 LCD (using i2c), and TFT/OLED (using SPI) screens e.g. st7789 up to 480x320 
+(advanced much later option user can select via rotary controller what info is seen on which screen/ screen layout etc)
+The choice of screen should be by compiler directive (ifdef). I will test with i2c 20x4 LCD for now (as hardware is built)
+
+Inputs will be by pair of contacts that can be closed to indicate PTT(from external sequencer) - this will be sent (very quickly) to the remote modules.
+other inputs: 
+push switch (e.g. arm/disarm)
+rotary encoder (for any complex menu options)
+possibly a USB(and maybe serial over USB , and serial rs232 for  PTT) connection to a computer - e.g. for computer control of a rotator -using a "standard " method of doing this.
+
+communications to remote modules will be by CANBUS. PTT must be a priority signal sent out to the other equipment.
+Inputs from remote kit must be "appropriately frequent" timings to be adjustable by parameters in the code, and adjustable via the screen and rotary controller (and saved), and these sent to the remote units, and saved there in EEPROM etc., to become the defaults
+Possible use of interrupts for PTT and PTT confirmed and PTT fail (but a fast deterministic loop is what has been done so far)
+The current timing loops are set for loop time performance, such that PTT is checked loop iteration, but AT MOST one other sensor etc. code is run per loop iteration
+
+When PTT is detected as input, the station controller checks for any errors at the station…if none it sends a PTT via CANBUS to module 2.
+Module 2 receives this and attempts to switch the transverter/linear to transmit (PTT). If configured (normally it will be  configured)  it checks to see if the device switches(PTT confirm - which will take the form of a pin going from HIGH to low). If it does, then a message is send back to the station controller to say PTT successful. ONLY if this is successful does the station controller set an output to confirm success back to the external sequencer (or radio) in the shack. If module 2 has ANY error, it drops the PTT out to linear/transverter and sends a PTT off and error to station. Station controller indicates PTT off, and turns off the output to the sequencer(or radio). An ALARM is raised (maybe audible as well as on screen - to be decided later) the reason for the alarm MUST be indicated.
+
+This may run on Arduino nano (for now) or teensy
+(Possibility of adding a sequencer into this….. Much later on)
+We should also have a link to an external PC so that the contest logging software can control a rotator. User Interface will be minos, or n1mm or log4om. middleware will be PstRotator or rotctld. 
+We need to write the code which should look like the firmware from Radio Artisan (K3NG) - i.e behave in the same way. hardware will be a KR-400RC and Yaesu G450, and hardware switching and module 4 will control this.
+
+Module 2
+This will be Remote at masthead with transverters/linear amplifiers/LNA. All communications will be by CANBUS.
+Will measure various conditions such as voltage, VSWR, temp, humidity and RF Drive level monitored by LED status (by colour sensor) and send to station. Will receive PTT from station (module 1) (over the CANBUS) - and will send an output to switch the linear/transverter etc into transmit mode, using an opto-relay.
+Default will be to use 1x DHT11 (for temp and humidity). Option to have a DS18B20 as well (or a 2nd DHT11) (to read 2 temperatures in different places)
+Option to use DHT22 as either 1st or 2nd temperature sensor.
+Will have (option to enable/disable) a sensor which can tell if the PTT signal sent to remote transverter etc has worked ( by measuring voltage across the 2 wires high - not switched…low successfully switched ). If the voltage does not drop, or fails to stay low  PTT will be assumed to have failed and create an error condition. Signal back to station controller to cancel PTT and display error condition
+ANY sensor going outside of  a defined parameter will cause an error condition. Errors must be signalled back to station as a priority. Most errors (Significant ones such as VSWR/PTT fail) will cause PTT to be stopped
+The entire point of this module is to prevent damage to transverters/linear amplifiers:
+Error conditions MUST fail safe, and errors must be communicated fast
+Ideally use of interrupts for PTT and PTT confirmed and PTT fail (but a fast deterministic loop is what has been done so far)
+The current timing loops are set for loop time performance, such that PTT is checked every time, but AT MOST one other sensor etc. code is run per loop iteration
+
+
+Module 3
+Remote compass
+Pi Pico running Arduino c using BNO085 sensor using SPI (or possibly Lis3mdl not sure if this does SPI, but I2c if it does not) to go at masthead to give feedback on exact mast position (sometimes I will use a different rotator with POOR positional feedback), and also this is a good double check the rotator has got to where it should be. Circuitry MAY have a means to de-power some or all of this (to be considered later) when PTT is on (high rf levels) - so there should be a digital pin which can change state to support this. All communications use CANBUS. Direction is sent to station periodically - parameter set in code(suggest 0.5s), and alterable via message from station (and then saved as default). Also direction can be queried from station.
+
+
+Module 4
+Rotator controller - to use KR-400RC controller with relay or solid state switches to control Yaesu g450 rotator, and read position and send this back to station controller. All comms by CANBUS.
+This module should take a position(target) sent over CANBUS, and move to it autonomously, sending positions every x seconds(a parameter set in the code default for now 0.5s, and ideally alterable by a message from the station  - and this then saved as the default). Position can also be queried from station
+This will be communicating to a firmware which should look like the Radio Artisan (K3NG) firmware. Basically we have this as a system split between module 1 and 4, using CANbus to communicate.
+
+May use Arduino nano or Pi Pico  
+
+
+Notes:
+The project is at https://github.com/zaxanoid/Test_arduino
+Suggested repo layout:
+Test_arduino/
+  libraries/
+    RSCP/                 (the Arduino library)
+  sketches/
+    Module1_Station/
+    Module2_Mast/
+    Module3_Compass/
+    Module4_Rotator/
+  README.md
+  docs/
+
+I have written a good chunk of this already, and had some help from chatGPT and a claudeAI. The separate parts are in this project, called "remote station system using canbus". 
+I now need to make sure that:
+1) all parts have the same definition of CANBUS messages and will talk to each other
+2) The code is well written and structured
+3) Existing pinouts/sensors/libraries are used
+4) Any advice you can give regarding improvements - but do not remove any features. The current timing loops are set for loop time performance, such that PTT is checked every time, but AT MOST one other sensor etc. code is run per loop iteration.
+
+The module 1 output for 20x4 LCD should be based on this:
+There will be more than 1 screen of information to be displayed, we will use a push switch to cycle through the "screens"
+
+(VSWR may be calculated for other screens but for for "front" screen one, just the letters OK, High, ERR
+for RF Drive we use OK, Low, High
+
+Output value format	Module 1 LCD 20x4  should show text 
+			Value (example )
+1 significant digit	Volts:	27.9
+letters			VSWR:	OK
+1 significant digit	Temp:	22.1
+Integer			Humidity: 50
+letters			Drive:	OK
+		
+		
+
+For pin mappings use the ones from GitHub pin table for Module 2.txt  (uploaded)
+Ideally also include in module 2 code for DS18B20  using spare pins 
+
+Error handling: I need to be able to adjust (in code) which errors are able to stop PTT.
+also allow operator to manually clear errors (at station) but NO auto clearing
+it would be nice to be able to adjust the settings for these parameters on the station controller, and save these as defaults. Suspect we need a "settings mode" to achieve this. Some of these settings need to be sent down to the remote modules (2,3,and 4), for them to put these into their settings, and made default there (in EEPROM).
+VBAT and VSWR calculations need to be allowed for, but done later (the functions should be written now, taking the analogue readings of voltage now, but scaling calcs can wait until later)
+
+Still supports 16x2 via compile define is good, but default to use 20x4 LCD - make this default please. Also on the 3rd line bear: for compass bearing and rot: for rotator feedback
+4th line ?
+and add the 
+a simple “settings summary” page on the 16x4 so you can sanity-check current defaults at a glance,
+and a settings ACK/status view (using RSCP_ID_CFG_ACK) so the station can display whether each remote actually saved the update.
+
+
+Can we build a TFT screen view now, with the same info as the 20x4 LCD. Nicer looking though... 
+More space so can see more of the values at the same time. colour can also help?
+Also add a settings screen so we can adjust all of the things that need adjusting 
+could even (maybe) do a small circle with a "compass needle" to show bearing? 
+
+and… are we still using a fast loop…have we considered the possibility of using interrupts to make sure the PTT on/off and error performance is quick enough?
+
+also consider adding a 2nd temp, 2nd drive and 2nd VSWR capability in module 2 (as we might measure both transverter and linear amp values. Might set different error values for these, and again an error would be raised if these are outside of agreed range. these will also need to be adjustable from station, and saved as defaults...and pushed to module 2
+
+Performance tuning…… do not bother to read and process (or send to CANbus) the temp/humidity/colour/vswr  when not needed
+E.g.
+drive (colour) ONLY needed when PTT is ON
+VSWR only read when PTT ON
+Humidity only read when PTT is OFF
+Temp always read
+Voltage always read
+
+Remember also that we only want to process (at most) 1 of these per loop iteration, but PTT detect/confirm/error EVERY  loop iteration
