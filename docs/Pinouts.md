@@ -46,43 +46,15 @@ Single source of truth for **hardware pin mappings** across the RemoteStationCAN
 
 ## Module 2 — Masthead Protection + PTT (Arduino Nano / AVR)
 
-**Definitive masthead mapping (matches your wiring plan).**
-
-### CAN (MCP2515)
-| Pin | Signal | Dir | Notes |
-|---|---|---:|---|
-| D10 | CAN_CS | Out | MCP2515 chip-select |
-| D2 | CAN_INT | In | MCP2515 interrupt (recommended; active-low typical) |
-| *(D11/D12/D13)* | MOSI/MISO/SCK | — | Hardware SPI (board default) |
-
-### PTT / control
-| Pin | Signal | Dir | Notes |
-|---|---|---:|---|
-| D7 | PTT_OUT | Out | Keys transverter/linear via opto/relay |
-| D6 | PTT_CONFIRM_IN | In | Confirms remote switching (polarity defined in code) |
-| D4 | PTT_MIRROR_LED | Out | LED mirrors PTT state (local) |
-
-### Sensors
-| Pin | Signal | Dir | Notes |
-|---|---|---:|---|
-| D8 | TEMP1_1WIRE | I/O | DS18B20 (Temp1) |
-| A0 | FWD_RAW | In | Forward power (ADC raw) |
-| A1 | REV_RAW | In | Reverse power (ADC raw) |
-| A2 | VBAT_RAW | In | Supply voltage (ADC raw) |
-| A4 | SDA | I/O | Colour sensor I2C (optional) |
-| A5 | SCL | I/O | Colour sensor I2C (optional) |
-
-### Optional / reserved (recommended)
-| Pin | Signal | Dir | Notes |
-|---|---|---:|---|
-| D9 | TEMP2_1WIRE | I/O | DS18B20 (Temp2) optional |
-| D5 | INHIBIT_IN | In | Optional inhibit/interlock input (INPUT_PULLUP) |
-| D3 | SPARE_DIGITAL | I/O | Spare digital IO |
-| A3 | SPARE_ANALOG | In | Spare analog input |
-| A6 | FWD2_RAW | In | Optional second forward channel (analog-only) |
-| A7 | REV2_RAW | In | Optional second reverse channel (analog-only) |
-
----
+|    Pin | Signal     | Function                                    | Notes                                                                                                                    |
+| -----: | ---------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **D8** | TEMP_HUM_1 | **Primary temperature & humidity sensor**   | Default **DHT11**. May be changed to **DHT22** by firmware define. Temp always read; humidity read only when PTT is OFF. |
+| **D9** | TEMP_2     | **Secondary temperature sensor (optional)** | Disabled by default in firmware. May be **DS18B20** (1-Wire) *or* **DHT11/DHT22** (temp only).                           |
+| **A0** | FWD_RAW    | Forward power ADC                           | Used for VSWR calculation (read only when PTT ON).                                                                       |
+| **A1** | REV_RAW    | Reflected power ADC                         | Used for VSWR calculation (read only when PTT ON).                                                                       |
+| **A2** | VBAT_RAW   | Supply voltage ADC                          | Always read.                                                                                                             |
+| **A4** | SDA        | I²C data                                    | Reserved for colour sensor (RF drive LED monitoring).                                                                    |
+| **A5** | SCL        | I²C clock                                   | Reserved for colour sensor (RF drive LED monitoring).                                                                    |
 
 ## Module 3 — Compass (Pi Pico / RP2040 + BNO085 + MCP2515)
 
