@@ -1,0 +1,49 @@
+This is a pin table for Module 2 (Masthead / Nano + MCP2515 + sensors).
+
+
+
+## Module 2 (Masthead) Pin Map — Arduino Nano (ATmega328P)
+
+### Digital pins
+
+| Pin | Function                            | Direction | Interface | Notes                                                     |
+| --- | ----------------------------------- | --------: | --------- | --------------------------------------------------------- |
+| D13 | CAN SCK                             |       Out | SPI       | MCP2515                                                   |
+| D12 | CAN MISO                            |        In | SPI       | MCP2515                                                   |
+| D11 | CAN MOSI                            |       Out | SPI       | MCP2515                                                   |
+| D10 | CAN CS                              |       Out | SPI       | MCP2515 chip select                                       |
+| D2  | CAN INT                             |        In | Interrupt | MCP2515 INT (active-low typically)                        |
+| D7  | PTT OUT                             |       Out | GPIO      | Drives opto/relay to key TX                               |
+| D6  | PTT CONFIRM IN                      |        In | GPIO      | Confirm sense input (polarity defined in code)            |
+| D4  | PTT MIRROR LED                      |       Out | GPIO      | “PTT active” indicator LED                                |
+| D8  | TEMP1 (DS18B20)                     |    In/Out | 1-Wire    | Your current “Temp” line                                  |
+| D9  | TEMP2 (DS18B20) **optional**        |    In/Out | 1-Wire    | Added: spare pin for 2nd DS18B20 if wanted                |
+| D5  | INHIBIT / INTERLOCK IN **optional** |        In | GPIO      | Added: hardware inhibit (door switch, sequencer OK, etc.) |
+| D3  | SPARE DIGITAL IO                    |    In/Out | GPIO      | Added: spare / future (buzzer, relay, extra status)       |
+| D0  | Serial RX                           |        In | UART      | Leave for USB serial (debug)                              |
+| D1  | Serial TX                           |       Out | UART      | Leave for USB serial (debug)                              |
+
+### Analog pins
+
+| Pin | Function          | Direction | Interface | Notes                                          |
+| --- | ----------------- | --------: | --------- | ---------------------------------------------- |
+| A0  | FWD (raw)         |        In | ADC       | Forward power (raw ADC)                        |
+| A1  | REV (raw)         |        In | ADC       | Reverse power (raw ADC)                        |
+| A2  | VBAT/Volts (raw)  |        In | ADC       | Supply voltage (raw ADC)                       |
+| A3  | SPARE ANALOG      |        In | ADC       | Added: spare (2nd volts, current sensor, etc.) |
+| A4  | Colour Sensor SDA |    In/Out | I²C       | TCS34725 etc.                                  |
+| A5  | Colour Sensor SCL |    In/Out | I²C       | TCS34725 etc.                                  |
+
+---
+
+## Notes you can paste under the table in GitHub
+
+* **SPI (CAN / MCP2515)** uses D10–D13; don’t reuse these for anything else.
+* **I²C** uses **A4/A5**; if colour sensor is enabled, those pins are reserved.
+* **PTT is priority**: D7 (PTT OUT) should remain dedicated.
+* **D2** is reserved for **CAN INT** (recommended for fast RX servicing).
+* **D0/D1** are left for serial debug; avoid using them for sensors unless you’re sure you won’t need Serial.
+
+---
+
+If you want, I can also generate a matching `#define` block for Module2 that exactly matches this table (so the table and code never drift).
