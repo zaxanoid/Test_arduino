@@ -3,7 +3,7 @@
 #include <EEPROM.h>
 #include <SPI.h>
 #include <mcp2515.h>
-#include "rscp_can_protocol_fixed.h"
+#include <rscp_can_protocol.h>
 
 // ======================================================
 // ===== DISPLAY SELECTION ===============================
@@ -62,8 +62,6 @@ Settings settings;
 // ===== TELEMETRY STATE =================================
 // ======================================================
 
-static uint32_t mast_err_bits = 0;
-
 struct MastState {
   uint16_t vbat_raw;
   uint8_t  vswr_state;
@@ -75,8 +73,10 @@ struct MastState {
 
 uint16_t compass_deg = 0;
 uint16_t rotator_deg = 0;
-// bool ptt_active defined in PTT HANDSHAKE section
-// bool ptt_confirmed defined in PTT HANDSHAKE section
+
+bool ptt_active = false;
+bool ptt_confirmed = false;
+
 // Heartbeats
 bool alive_m2 = false;
 bool alive_m3 = false;
@@ -152,30 +152,32 @@ void loadSettings() {
 // ===== CAN TX ==========================================
 // ======================================================
 
-void sendCfg(uint8_t destModule, uint8_t key, uint32_t value) {
+void sendCfg(uint8_t key, uint32_t value) {
   canTx.can_id  = RSCP_ID_CFG_SET;
   canTx.can_dlc = 8;
-  memset(canTx.data, 0, 8);
-  canTx.data[0] = destModule;
-  canTx.data[1] = key;
-  rscp_put_u32(&canTx.data[4], value);
+  canTx.data[0] = key;
+  canTx.data[1] = 0;
+  canTx.data[2] = 0;
+  canTx.data[3] = 0;
+  rscp_u32_to_le(&canTx.data[4], value);
   mcp2515.sendMessage(&canTx);
 }
 
 void pushSettingsToRemotes() {
-  // Module 2 (masthead)
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_PTT_MAX_MS,        settings.ptt_max_ms);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_STOP_PTT_ERR_MASK, settings.stop_ptt_err_mask);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_VBAT_LOW_RAW,      settings.vbat_low_raw);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_VSWR1_HIGH_RAW,    settings.vswr1_high_raw);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_VSWR2_HIGH_RAW,    settings.vswr2_high_raw);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_TEMP1_HIGH_X10,    (uint32_t)(int32_t)settings.temp1_high_x10);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_TEMP2_HIGH_X10,    (uint32_t)(int32_t)settings.temp2_high_x10);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_HUM_HIGH_PCT,      settings.hum_high_pct);
+  sendCfg(RSCP_CFG_PTT_MAX_MS,        settings.ptt_max_ms);
+  //sendCfg(RSCP_CFG_STOP_PTT_MASK,     settings.stop_ptt_err_mask);
+  sendCfg(RSCP_CFG_STOP_PTT_ERR_MASK, settings.stop_ptt_err_mask);
 
-  // Module 3 + 4 periods
-  sendCfg(RSCP_MOD_COMPASS, RSCP_CFG_COMPASS_PERIOD_MS, settings.compass_period_ms);
-  sendCfg(RSCP_MOD_ROTATOR, RSCP_CFG_ROTATOR_PERIOD_MS, settings.rotator_period_ms);
+
+  sendCfg(RSCP_CFG_COMPASS_PERIOD_MS, settings.compass_period_ms);
+  sendCfg(RSCP_CFG_ROTATOR_PERIOD_MS, settings.rotator_period_ms);
+
+  sendCfg(RSCP_CFG_VBAT_LOW_RAW,   settings.vbat_low_raw);
+  sendCfg(RSCP_CFG_VSWR1_HIGH_RAW, settings.vswr1_high_raw);
+  sendCfg(RSCP_CFG_VSWR2_HIGH_RAW, settings.vswr2_high_raw);
+  sendCfg(RSCP_CFG_TEMP1_HIGH_X10, settings.temp1_high_x10);
+  sendCfg(RSCP_CFG_TEMP2_HIGH_X10, settings.temp2_high_x10);
+  sendCfg(RSCP_CFG_HUM_HIGH_PCT,   settings.hum_high_pct);
 
   cfgAckM2 = cfgAckM3 = cfgAckM4 = 0xFF;
 }
@@ -188,55 +190,21 @@ void processCan() {
   while (mcp2515.readMessage(&canRx) == MCP2515::ERROR_OK) {
     switch (canRx.can_id) {
 
-      
-      case RSCP_ID_PTT_STATUS: {
-        // data0=state, data1=seq, data2=status_flags, data3=err_latched
-        const uint8_t state = canRx.data[0];
-        const uint8_t seq   = canRx.data[1];
-        const uint8_t flags = canRx.data[2];
-        const bool errLatched = (canRx.data[3] != 0);
-
-        // Only accept confirmation for the most recent command sequence
-        if (seq == last_cmd_seq) {
-          if (state == RSCP_PTT_ON) {
-            ptt_confirmed = ((flags & RSCP_PTTSTAT_CONFIRMED) != 0) && !errLatched;
-          } else {
-            ptt_confirmed = false;
-          }
-        } else {
-          // If remote announces OFF for any seq, treat as OFF safety
-          if (state == RSCP_PTT_OFF) ptt_confirmed = false;
-        }
-        break;
-      }
-
-      case RSCP_ID_ERR_STATUS: {
-        // data0=module_id, data1=severity, data2..5=err_bits(uint32)
-        const uint8_t mod = canRx.data[0];
-        const uint8_t sev = canRx.data[1];
-        const uint32_t bits = rscp_get_u32(&canRx.data[2]);
-
-        if (mod == RSCP_MOD_MAST) {
-          mast_err_bits = bits;
-        }
-        // Basic safety: any ERROR/FATAL from mast drops confirmed PTT
-        if (mod == RSCP_MOD_MAST && (sev >= RSCP_SEV_ERROR) && bits != RSCP_ERR_NONE) {
-          ptt_confirmed = false;
-        }
-        break;
-      }
-
       case RSCP_ID_ENV_TELEM:
-        mast.temp_x10 = rscp_get_i16(&canRx.data[0]);
-        mast.humidity = canRx.data[2];
-        mast.vbat_raw = rscp_get_u16(&canRx.data[3]);
+        mast.temp_x10  = (int16_t)rscp_get_u16(&canRx.data[0]);
+
+        mast.humidity  = canRx.data[2];
+        alive_m2 = true;
         lastEnvMs = millis();
+
         break;
 
       case RSCP_ID_RF_TELEM:
-        mast.vswr_state  = canRx.data[0];
-        mast.drive_state = canRx.data[1];
+        mast.vbat_raw   = rscp_get_u16(&canRx.data[0]);
+        mast.vswr_state = canRx.data[2];
+        mast.drive_state= canRx.data[3];
         lastRfMs = millis();
+
         break;
 
       case RSCP_ID_HEADING:
@@ -304,56 +272,28 @@ void renderLCD() {
 // ===== PTT =============================================
 // ======================================================
 
-
-// ======================================================
-// ===== PTT HANDSHAKE ==================================
-// ======================================================
-
-// Local PTT state
-static bool     ptt_active = false;       // external PTT input state (debounced minimally)
-static bool     ptt_confirmed = false;    // remote confirmed
-static uint8_t  ptt_seq = 0;              // increments on each command edge
-static uint8_t  last_cmd_seq = 0;
-static uint32_t last_ptt_cmd_ms = 0;
-
-static inline void sendPttCmd(uint8_t onoff) {
-  uint8_t d[8] = {0};
-  d[0] = onoff ? RSCP_PTT_ON : RSCP_PTT_OFF;
-  d[1] = ++ptt_seq;
-  d[2] = 0; // flags reserved
-  last_cmd_seq = ptt_seq;
-  last_ptt_cmd_ms = millis();
-
-  canTx.can_id  = RSCP_ID_PTT_CMD;
-  canTx.can_dlc = 8;
-  memcpy(canTx.data, d, 8);
-  mcp2515.sendMessage(&canTx);
-}
-
 void handlePtt() {
-  // External PTT input: active LOW
-  const bool in = (digitalRead(PIN_PTT_IN) == LOW);
+  bool in = digitalRead(PIN_PTT_IN) == LOW;
 
-  // Rising edge: request PTT
   if (in && !ptt_active) {
-    sendPttCmd(1);
+    canTx.can_id  = RSCP_ID_PTT_CMD;
+    canTx.can_dlc = 1;
+    canTx.data[0] = 1;
+    mcp2515.sendMessage(&canTx);
     ptt_active = true;
-    // do NOT assert PIN_PTT_OUT until confirmed by remote
   }
 
-  // Falling edge: drop PTT immediately (and clear confirmation)
   if (!in && ptt_active) {
-    sendPttCmd(0);
+    canTx.can_id  = RSCP_ID_PTT_CMD;
+    canTx.can_dlc = 1;
+    canTx.data[0] = 0;
+    mcp2515.sendMessage(&canTx);
     ptt_active = false;
-    ptt_confirmed = false;
   }
 
-  // If we are active but not confirmed for too long, keep output low.
-  // (remote may be inhibited or offline)
   digitalWrite(PIN_PTT_LED, ptt_active);
   digitalWrite(PIN_PTT_OUT, ptt_confirmed);
 }
-
 
 // ======================================================
 // ===== SETUP / LOOP ===================================
