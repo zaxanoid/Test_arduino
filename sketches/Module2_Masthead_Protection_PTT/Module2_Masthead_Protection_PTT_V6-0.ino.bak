@@ -28,19 +28,6 @@
 
 #include "rscp_can_protocol.h"
 
-
-// ---- Compatibility aliases (older/newer protocol headers)
-#ifndef RSCP_NODE_MAST
-#define RSCP_NODE_MAST RSCP_MOD_MAST
-#endif
-#ifndef RSCP_NODE_BROADCAST
-// In v1.4 header broadcast module ID is not defined; we use 0 to mean "all modules"
-#define RSCP_NODE_BROADCAST 0
-#endif
-#ifndef RSCP_CFG_DROP_MASK
-// Older docs used DROP_MASK; protocol header uses STOP_PTT_ERR_MASK
-#define RSCP_CFG_DROP_MASK RSCP_CFG_STOP_PTT_ERR_MASK
-#endif
 // ---- Optional sensors ----
 #include <DHT.h>
 
@@ -104,8 +91,8 @@ static uint32_t max_ptt_ms = 300000UL;    // 300s default
 static uint32_t ptt_on_start_ms = 0;
 
 // ---- Error handling ----
-static uint32_t err_bits = 0;
-static uint32_t stop_ptt_err_mask = 0;            // which errors should drop PTT
+static uint16_t err_bits = 0;
+static uint16_t drop_mask = 0;            // which errors should drop PTT
 static bool err_latched = false;
 
 // error bit assignments (keep aligned with CAN_Messages.md)
@@ -159,25 +146,20 @@ static void sendBoot();
 static void sendHeartbeat();
 static void sendErrStatus();
 static void setPtt(bool on, uint8_t seq, bool forceSendStatus);
-static void sendPttStatus(bool result_ok, bool confirmed, bool inhibited) {
-  // Protocol v1.4: RSCP_ID_PTT_STATUS:
-  // data0=state (1/0), data1=seq, data2=status_flags, data3=err_latched(1/0)
-  // NOTE: latency/overtime details are carried via ERR bits (e.g. RSCP_ERR_OVERTIME).
-  uint8_t d[8] = {0};
-  d[0] = ptt_active_hw ? RSCP_PTT_ON : RSCP_PTT_OFF;
-  d[1] = last_ptt_seq;
+static void sendPttStatus(bool result_ok, bool confirmed, bool inhibited);
+static void sendEnvTelem(int16_t temp_x10, uint8_t humidity_pct, uint16_t psu_raw);
+static void sendRfTelem(uint8_t vswr_state, uint8_t drive_state);
 
-  uint8_t flags = 0;
-  if (confirmed) flags |= 0x01;
-  if (inhibited) flags |= 0x02;
-  if (last_overtime_drop) flags |= 0x04;
-  if (!result_ok) flags |= 0x08; // local "FAIL" indicator (reserved)
-  d[2] = flags;
+static void latchError(uint16_t bits);
+static void clearErrors();
+static bool inhibitActive();
+static bool pttConfirmed();
 
-  d[3] = err_latched ? 1 : 0;
-
-  d[4] = d[5] = d[6] = d[7] = 0;
-  canSend8(RSCP_ID_PTT_STATUS, d);
+// ---- Implementation ----
+static bool inhibitActive() {
+  // optional inhibit input; treat HIGH as active inhibit
+  if (PIN_PTT_INHIBIT == 0xFF) return false;
+  return (digitalRead(PIN_PTT_INHIBIT) == HIGH);
 }
 
 static bool pttConfirmed() {
@@ -185,13 +167,13 @@ static bool pttConfirmed() {
   return (digitalRead(PIN_PTT_CONFIRM) == LOW);
 }
 
-static void latchError(uint32_t bits) {
+static void latchError(uint16_t bits) {
   err_bits |= bits;
   err_latched = (err_bits != 0);
   // On first latch of a new bit, publish immediately
   sendErrStatus();
   // Drop PTT if configured
-  if ((stop_ptt_err_mask & bits) != 0) {
+  if ((drop_mask & bits) != 0) {
     setPtt(false, last_ptt_seq, true);
   }
 }
@@ -203,19 +185,14 @@ static void clearErrors() {
 }
 
 static void sendErrStatus() {
-  // Protocol v1.4: RSCP_ID_ERR_STATUS: data0=module_id, data1=severity, data2..5=err_bits(uint32)
   uint8_t d[8] = {0};
-  d[0] = RSCP_MOD_MAST;
-
-  uint8_t sev = RSCP_SEV_INFO;
-  if (err_bits != 0) sev = RSCP_SEV_ERROR;
-  d[1] = sev;
-
-  // err_bits is a bitmask (uint32)
-  put_u32(&d[2], (uint32_t)err_bits);
-
-  d[6] = 0;
-  d[7] = 0;
+  d[0] = RSCP_NODE_MAST;
+  d[1] = err_latched ? 1 : 0;
+  put_u16(&d[2], err_bits);
+  put_u16(&d[4], drop_mask);
+  d[6] = ptt_active_hw ? 1 : 0;
+  static uint8_t seq = 0;
+  d[7] = seq++;
   canSend8(RSCP_ID_ERR_STATUS, d);
 }
 
@@ -275,26 +252,32 @@ static void setPtt(bool on, uint8_t seq, bool forceSendStatus) {
   }
 }
 
-static void sendEnvTelem(int16_t temp_x10, uint8_t humidity_pct, uint16_t temp2_x10_or_na) {
-  // Protocol v1.4: RSCP_ID_ENV_TELEM:
-  // temp_c_x10(int16 LE), rh_pct(uint8), temp2_c_x10(int16 LE) or 0x7FFF if n/a, remaining reserved
+static void sendEnvTelem(int16_t temp_x10, uint8_t humidity_pct, uint16_t psu_raw) {
   uint8_t d[8] = {0};
-  put_i16(&d[0], temp_x10);
-  d[2] = humidity_pct;
-  put_i16(&d[3], (int16_t)temp2_x10_or_na);
-  d[5] = d[6] = d[7] = 0;
+  d[0] = RSCP_NODE_MAST;
+  put_i16(&d[1], temp_x10);
+  d[3] = humidity_pct;
+  put_u16(&d[4], psu_raw);
+  uint8_t flags = 0x01;            // temp valid
+  if (humidity_pct <= 100) flags |= 0x02;
+  flags |= 0x04;                   // psu valid
+  d[6] = flags;
+  static uint8_t seq = 0;
+  d[7] = seq++;
   canSend8(RSCP_ID_ENV_TELEM, d);
 }
 
 static void sendRfTelem(uint8_t vswr_state, uint8_t drive_state) {
-  // Protocol v1.4: RSCP_ID_RF_TELEM:
-  // vbat_raw(uint16), fwd_raw(uint16), rev_raw(uint16), drive_state(uint8), vswr_state(uint8)
   uint8_t d[8] = {0};
-  put_u16(&d[0], psu_raw_cache);
-  put_u16(&d[2], fwd_raw_cache);
-  put_u16(&d[4], rev_raw_cache);
-  d[6] = drive_state;
-  d[7] = vswr_state;
+  d[0] = RSCP_NODE_MAST;
+  d[1] = vswr_state;
+  d[2] = drive_state;
+  d[3] = ptt_active_hw ? 1 : 0;
+  d[4] = 0x03; // VSWR_VALID | DRIVE_VALID
+  d[5] = 0;
+  d[6] = 0;
+  static uint8_t seq = 0;
+  d[7] = seq++;
   canSend8(RSCP_ID_RF_TELEM, d);
 }
 
@@ -334,37 +317,36 @@ static void processCan() {
       setPtt(on, last_ptt_seq, true);
     }
     else if (id == RSCP_ID_CFG_SET) {
-  // Protocol v1.4: data0=module_id (0=broadcast), data1=key, data2..5=u32 value
-  const uint8_t dest = d[0];
-  if (dest != RSCP_MOD_MAST && dest != RSCP_NODE_BROADCAST) continue;
+      // data0=dest, data1=key, data4..7=u32 value
+      const uint8_t dest = d[0];
+      if (dest != RSCP_NODE_MAST && dest != RSCP_NODE_BROADCAST) continue;
 
-  const uint8_t key = d[1];
-  const uint32_t val = get_u32(&d[2]);
+      const uint8_t key = d[1];
+      const uint32_t val = get_u32(&d[4]);
 
-  bool ok = true;
-  switch (key) {
-    case RSCP_CFG_PTT_MAX_MS:
-      max_ptt_ms = val;
-      break;
-    case RSCP_CFG_STOP_PTT_ERR_MASK:
-      // Stored locally as uint32; your internal err_bits are uint32 too
-      stop_ptt_err_mask = val;
-      break;
-    default:
-      ok = false;
-      break;
-  }
+      bool ok = true;
+      switch (key) {
+        case RSCP_CFG_PTT_MAX_MS:
+          max_ptt_ms = val;
+          break;
+        case RSCP_CFG_DROP_MASK:
+          drop_mask = (uint16_t)(val & 0xFFFFu);
+          break;
+        default:
+          ok = false;
+          break;
+      }
 
-  // ACK: RSCP_ID_CFG_ACK: data0=module_id, data1=key, data2=status(0=ok), rest reserved
-  uint8_t a[8] = {0};
-  a[0] = RSCP_MOD_MAST;
-  a[1] = key;
-  a[2] = ok ? 0 : 1;
-  a[3] = 0;
-  a[4] = a[5] = a[6] = a[7] = 0;
-  canSend8(RSCP_ID_CFG_ACK, a);
-}
-else if (id == RSCP_ID_ERR_CLEAR)else if (id == RSCP_ID_ERR_CLEAR) {
+      // ACK
+      uint8_t a[8] = {0};
+      a[0] = RSCP_NODE_MAST;
+      a[1] = key;
+      a[2] = ok ? 1 : 0;
+      a[3] = 0;
+      put_u32(&a[4], val);
+      canSend8(RSCP_ID_CFG_ACK, a);
+    }
+    else if (id == RSCP_ID_ERR_CLEAR) {
       // optional: allow station to clear errors
       clearErrors();
     }
@@ -405,7 +387,7 @@ void setup() {
   next_rf_telem_ms  = now_ms + 200;
 
   // default: drop PTT on critical errors
-  stop_ptt_err_mask = ERR_VSWR | ERR_DRIVE | ERR_PTT_CONFIRM_FAIL | ERR_PSU;
+  drop_mask = ERR_VSWR | ERR_DRIVE | ERR_PTT_CONFIRM_FAIL | ERR_PSU;
 
   sendBoot();
   sendHeartbeat();
