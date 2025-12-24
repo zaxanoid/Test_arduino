@@ -28,50 +28,14 @@
 
 #include "rscp_can_protocol.h"
 
-// ======================================================
-// ===== DEBUG SERIAL (TEMP) =============================
-// Comment out or set to 0 when finished debugging.
-// ======================================================
-#define RSCP_DEBUG_SERIAL 1
-
-#if RSCP_DEBUG_SERIAL
-  #define DBG_BEGIN(baud)    Serial.begin(baud)
-  #define DBG_PRINT(x)       Serial.print(x)
-  #define DBG_PRINTLN(x)     Serial.println(x)
-  #define DBG_PRINT_HEX(x)   Serial.print((x), HEX)
-#else
-  #define DBG_BEGIN(baud)
-  #define DBG_PRINT(x)
-  #define DBG_PRINTLN(x)
-  #define DBG_PRINT_HEX(x)
-#endif
-
-static void dbgPrintFrame(const char* tag, uint16_t id, const uint8_t* d, uint8_t len) {
-#if RSCP_DEBUG_SERIAL
-  DBG_PRINT(tag);
-  DBG_PRINT(" id=0x"); DBG_PRINT_HEX(id);
-  DBG_PRINT(" len="); DBG_PRINT(len);
-  DBG_PRINT(" data=");
-  for (uint8_t i = 0; i < len; i++) {
-    if (d[i] < 16) DBG_PRINT('0');
-    DBG_PRINT_HEX(d[i]);
-    DBG_PRINT(' ');
-  }
-  DBG_PRINTLN("");
-#else
-  (void)tag; (void)id; (void)d; (void)len;
-#endif
-}
-
-
 
 // ---- Compatibility aliases (older/newer protocol headers)
-#ifndef RSCP_MOD_MAST
-#define RSCP_MOD_MAST RSCP_MOD_MAST
+#ifndef RSCP_NODE_MAST
+#define RSCP_NODE_MAST RSCP_MOD_MAST
 #endif
-#ifndef RSCP_MOD_BROADCAST
+#ifndef RSCP_NODE_BROADCAST
 // In v1.4 header broadcast module ID is not defined; we use 0 to mean "all modules"
-#define RSCP_MOD_BROADCAST 0
+#define RSCP_NODE_BROADCAST 0
 #endif
 #ifndef RSCP_CFG_DROP_MASK
 // Older docs used DROP_MASK; protocol header uses STOP_PTT_ERR_MASK
@@ -139,6 +103,9 @@ static bool     last_overtime_drop = false;
 static uint32_t max_ptt_ms = 300000UL;    // 300s default
 static uint32_t ptt_on_start_ms = 0;
 
+// PTT confirmation policy (set by station via config; default disabled)
+static bool require_ptt_confirm = false;
+
 // ---- Error handling ----
 static uint32_t err_bits = 0;
 static uint32_t stop_ptt_err_mask = 0;            // which errors should drop PTT
@@ -188,7 +155,6 @@ static void canSend8(uint16_t can_id, const uint8_t d[8]) {
   tx.can_id  = can_id;
   tx.can_dlc = 8;
   memcpy(tx.data, d, 8);
-    dbgPrintFrame(\"TX\", (uint16_t)can_id, d, 8);
   mcp2515.sendMessage(&tx);
 }
 
@@ -287,7 +253,7 @@ static void setPtt(bool on, uint8_t seq, bool forceSendStatus) {
   // confirmation handling (only meaningful when trying to be ON)
   bool confirmed = (on ? pttConfirmed() : false);
   bool ok = true;
-  if (on) {
+  if (on && require_ptt_confirm) {
     ok = confirmed;
     if (!confirmed) latchError(ERR_PTT_CONFIRM_FAIL);
   }
@@ -322,7 +288,7 @@ static void sendRfTelem(uint8_t vswr_state, uint8_t drive_state) {
 
 static void sendBoot() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_MOD_MAST;
+  d[0] = RSCP_NODE_MAST;
   d[1] = 1; // boot
   put_u16(&d[2], 0); // reset reason (todo)
   put_u32(&d[4], 0);
@@ -331,13 +297,13 @@ static void sendBoot() {
 
 static void sendHeartbeat() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_MOD_MAST;
+  d[0] = RSCP_NODE_MAST;
   d[1] = ptt_active_hw ? 1 : 0;
   put_u32(&d[2], (uint32_t)now_ms);
   d[6] = err_latched ? 1 : 0;
   static uint8_t seq = 0;
   d[7] = seq++;
-  canSend8(RSCP_ID_HEARTBEAT, d);  DBG_PRINTLN(\"Heartbeat sent\");
+  canSend8(RSCP_ID_HEARTBEAT, d);
 }
 
 static void processCan() {
@@ -346,8 +312,7 @@ static void processCan() {
     uint16_t id = (uint16_t)rxMsg.can_id;
     const uint8_t *d = rxMsg.data;
 
-        dbgPrintFrame(\"RX\", id, d, rxMsg.can_dlc);
-if (id == RSCP_ID_PTT_CMD) {
+    if (id == RSCP_ID_PTT_CMD) {
       // data0=on/off (RSCP_PTT_ON/OFF), data1=seq
       const bool on = (d[0] == RSCP_PTT_ON);
       last_ptt_seq = d[1];
@@ -359,7 +324,7 @@ if (id == RSCP_ID_PTT_CMD) {
     else if (id == RSCP_ID_CFG_SET) {
   // Protocol v1.4: data0=module_id (0=broadcast), data1=key, data2..5=u32 value
   const uint8_t dest = d[0];
-  if (dest != RSCP_MOD_MAST && dest != RSCP_MOD_BROADCAST) continue;
+  if (dest != RSCP_MOD_MAST && dest != RSCP_NODE_BROADCAST) continue;
 
   const uint8_t key = d[1];
   const uint32_t val = get_u32(&d[2]);
@@ -372,6 +337,9 @@ if (id == RSCP_ID_PTT_CMD) {
     case RSCP_CFG_STOP_PTT_ERR_MASK:
       // Stored locally as uint32; your internal err_bits are uint32 too
       stop_ptt_err_mask = val;
+      break;
+    case RSCP_CFG_PTT_CONFIRM_ENABLE:
+      require_ptt_confirm = (val != 0);
       break;
     default:
       ok = false;
@@ -419,16 +387,10 @@ void setup() {
 
   SPI.begin();
   mcp2515.reset();
+  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
+  mcp2515.setNormalMode();
 
-  // ===== DEBUG (TEMP): report CAN init status =====
-  MCP2515::ERROR e;
-  e = mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
-  DBG_PRINT("CAN setBitrate: "); DBG_PRINTLN((int)e);
-  e = mcp2515.setNormalMode();
-  DBG_PRINT("CAN setNormalMode: "); DBG_PRINTLN((int)e);
-  // ================================================
-
-now_ms = millis();
+  now_ms = millis();
   next_sensor_tick_ms = now_ms + SENSOR_TICK_MS;
   next_env_telem_ms = now_ms + 200;
   next_rf_telem_ms  = now_ms + 200;
@@ -438,6 +400,7 @@ now_ms = millis();
 
   sendBoot();
   sendHeartbeat();
+  Serial.println("M2 heartbeat sent"); // heartbeat sent serial mnessage
   sendErrStatus();
 }
 
@@ -449,13 +412,15 @@ void loop() {
 
   // 2) PTT confirm + overtime every loop
   if (ptt_active_hw) {
-    // confirm must remain valid
-    if (!pttConfirmed()) {
-      latchError(ERR_PTT_CONFIRM_FAIL);
-      setPtt(false, last_ptt_seq, true);
+    if (require_ptt_confirm) {
+      // confirm must remain valid
+      if (!pttConfirmed()) {
+        latchError(ERR_PTT_CONFIRM_FAIL);
+        setPtt(false, last_ptt_seq, true);
+      }
     }
 
-    // overtime enforcement
+    // overtime enforcement (always active when PTT is ON)
     if (!last_overtime_drop && (now_ms - ptt_on_start_ms) > max_ptt_ms) {
       last_overtime_drop = true;
       setPtt(false, last_ptt_seq, true);

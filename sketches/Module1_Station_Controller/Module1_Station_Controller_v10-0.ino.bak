@@ -5,29 +5,6 @@
 #include <mcp2515.h>
 #include "rscp_can_protocol.h"
 
-// ======================================================
-// ===== DEBUG CAN RX (TEMP) =============================
-// Comment out or set to 0 when finished debugging.
-// ======================================================
-#define RSCP_DEBUG_CAN_RX 1
-
-#if RSCP_DEBUG_CAN_RX
-  static void dbgPrintRx(const struct can_frame &f) {
-    Serial.print("M1 RX id=0x");
-    Serial.print((uint16_t)f.can_id, HEX);
-    Serial.print(" len=");
-    Serial.print(f.can_dlc);
-    Serial.print(" data=");
-    for (uint8_t i=0; i<f.can_dlc; i++) {
-      if (f.data[i] < 16) Serial.print('0');
-      Serial.print(f.data[i], HEX);
-      Serial.print(' ');
-    }
-    Serial.println();
-  }
-#endif
-
-
 // ---- PTT_STATUS flag bits (v1.4 uses raw bitfield in data[2]) ----
 #ifndef RSCP_PTTSTAT_CONFIRMED
 #define RSCP_PTTSTAT_CONFIRMED 0x01
@@ -120,6 +97,13 @@ uint16_t rotator_deg = 0;
 bool alive_m2 = false;
 bool alive_m3 = false;
 bool alive_m4 = false;
+
+// ===== RSCP node presence tracking (any RX updates last-seen) =====
+static constexpr uint8_t  RSCP_MAX_MODULES = 16;
+static uint32_t module_last_seen_ms[RSCP_MAX_MODULES];
+static bool     module_seen[RSCP_MAX_MODULES];
+static constexpr uint32_t MODULE_OK_MS   = 3000UL;
+static constexpr uint32_t MODULE_LOST_MS = 8000UL;
 
 // CFG ACK status
 uint8_t cfgAckM2 = 0xFF;
@@ -228,10 +212,25 @@ void pushSettingsToRemotes() {
 
 void processCan() {
   while (mcp2515.readMessage(&canRx) == MCP2515::ERROR_OK) {
-    #if RSCP_DEBUG_CAN_RX
-    dbgPrintRx(canRx);
-#endif
-switch (canRx.can_id) {
+    // Update module presence based on any received frame
+    uint8_t src = 0xFF;
+    switch (canRx.can_id) {
+      case RSCP_ID_HEARTBEAT:   src = canRx.data[0]; break;
+      case RSCP_ID_ERR_STATUS:  src = canRx.data[0]; break;
+      case RSCP_ID_CFG_ACK:     src = canRx.data[0]; break;
+      case RSCP_ID_PTT_STATUS:
+      case RSCP_ID_ENV_TELEM:
+      case RSCP_ID_RF_TELEM:    src = RSCP_MOD_MAST; break;
+      case RSCP_ID_HEADING:     src = RSCP_MOD_COMPASS; break;
+      case RSCP_ID_ROT_STATUS:  src = RSCP_MOD_ROTATOR; break;
+      default: break;
+    }
+    if (src < RSCP_MAX_MODULES) {
+      module_last_seen_ms[src] = millis();
+      module_seen[src] = true;
+    }
+
+    switch (canRx.can_id) {
 
       
       case RSCP_ID_PTT_STATUS: {
@@ -327,6 +326,24 @@ switch (canRx.can_id) {
 // ===== UI ==============================================
 // ======================================================
 
+static inline const char* moduleStatus2(uint8_t id, uint32_t now) {
+  if (id >= RSCP_MAX_MODULES) return "??";
+  if (!module_seen[id]) return "NA";
+  const uint32_t age = now - module_last_seen_ms[id];
+  if (age <= MODULE_OK_MS) return "OK";
+  if (age <= MODULE_LOST_MS) return "LO";
+  return "!!";
+}
+
+static inline char moduleStatus1(uint8_t id, uint32_t now) {
+  const char* s = moduleStatus2(id, now);
+  // Map to single char for compact display
+  if (s[0] == 'O') return 'O';
+  if (s[0] == 'N') return '-';
+  if (s[0] == 'L') return 'L';
+  return '!';
+}
+
 void renderLCD() {
   const uint32_t now = millis();
   const bool rfStale  = (now - lastRfMs)  > 4000UL;   // no RF telem in 4s
@@ -370,7 +387,7 @@ void renderLCD() {
   lcd.print(rotator_deg);
   lcd.print("    ");
 
-  // Line 3: PTT state + Error + module alive
+    // Line 3: PTT state + Module-2 presence + Error indicator
   lcd.setCursor(0,3);
   lcd.print("PTT:");
   if (!ptt_in_active) {
@@ -380,17 +397,19 @@ void renderLCD() {
   } else {
     lcd.print("REQ");
   }
+
+  lcd.print(" M2:");
+  lcd.print(moduleStatus2(RSCP_MOD_MAST, now));
+
   lcd.print(" E:");
-  if (!m2Alive) {
+  // Error display only meaningful if M2 has been seen recently
+  const bool m2OkNow = (moduleStatus2(RSCP_MOD_MAST, now)[0] == 'O');
+  if (!m2OkNow) {
     lcd.print("-");
   } else {
     lcd.print(mast.err_flags ? "Y" : "N");
   }
-  lcd.print(" ");
-  lcd.print(m2Alive ? "2" : "-");
-  lcd.print(alive_m3 ? "3" : "-");
-  lcd.print(alive_m4 ? "4" : "-");
-  lcd.print("   ");
+  lcd.print("  ");
 #endif
 }
 
@@ -468,10 +487,7 @@ void handlePtt() {
 // ======================================================
 
 void setup() {
-  
-  Serial.begin(115200); // DEBUG (TEMP)
-  delay(200);
-pinMode(PIN_PTT_IN, INPUT);  // active HIGH with external 10k pulldown
+  pinMode(PIN_PTT_IN, INPUT);  // active HIGH with external 10k pulldown
   pinMode(PIN_PTT_OUT, OUTPUT);
   pinMode(PIN_PTT_LED, OUTPUT);
   pinMode(PIN_BTN, INPUT_PULLUP);
@@ -479,6 +495,12 @@ pinMode(PIN_PTT_IN, INPUT);  // active HIGH with external 10k pulldown
   Wire.begin();
   lcd.init();
   lcd.backlight();
+
+  // Init module presence tracking
+  for (uint8_t i = 0; i < RSCP_MAX_MODULES; i++) {
+    module_last_seen_ms[i] = 0;
+    module_seen[i] = false;
+  }
 
   SPI.begin();
   mcp2515.reset();
