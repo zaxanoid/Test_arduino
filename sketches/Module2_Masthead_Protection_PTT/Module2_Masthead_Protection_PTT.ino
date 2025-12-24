@@ -188,7 +188,7 @@ static void canSend8(uint16_t can_id, const uint8_t d[8]) {
   tx.can_id  = can_id;
   tx.can_dlc = 8;
   memcpy(tx.data, d, 8);
-    dbgPrintFrame(\"TX\", (uint16_t)can_id, d, 8);
+    dbgPrintFrame("TX", (uint16_t)can_id, d, 8);
   mcp2515.sendMessage(&tx);
 }
 
@@ -347,7 +347,7 @@ static void processCan() {
     uint16_t id = (uint16_t)rxMsg.can_id;
     const uint8_t *d = rxMsg.data;
 
-        dbgPrintFrame(\"RX\", id, d, rxMsg.can_dlc);
+        dbgPrintFrame("RX", id, d, rxMsg.can_dlc);
 if (id == RSCP_ID_PTT_CMD) {
       // data0=on/off (RSCP_PTT_ON/OFF), data1=seq
       const bool on = (d[0] == RSCP_PTT_ON);
