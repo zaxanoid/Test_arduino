@@ -337,7 +337,8 @@ static void sendHeartbeat() {
   d[6] = err_latched ? 1 : 0;
   static uint8_t seq = 0;
   d[7] = seq++;
-  canSend8(RSCP_ID_HEARTBEAT, d);  DBG_PRINTLN(\"Heartbeat sent\");
+  canSend8(RSCP_ID_HEARTBEAT, d);  
+  DBG_PRINTLN("Heartbeat sent");
 }
 
 static void processCan() {
@@ -423,9 +424,11 @@ void setup() {
   // ===== DEBUG (TEMP): report CAN init status =====
   MCP2515::ERROR e;
   e = mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
-  DBG_PRINT("CAN setBitrate: "); DBG_PRINTLN((int)e);
+  DBG_PRINT("CAN setBitrate: "); 
+  DBG_PRINTLN((int)e);
   e = mcp2515.setNormalMode();
-  DBG_PRINT("CAN setNormalMode: "); DBG_PRINTLN((int)e);
+  DBG_PRINT("CAN setNormalMode: "); 
+  DBG_PRINTLN((int)e);
   // ================================================
 
 now_ms = millis();
