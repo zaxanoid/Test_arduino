@@ -103,9 +103,6 @@ static bool     last_overtime_drop = false;
 static uint32_t max_ptt_ms = 300000UL;    // 300s default
 static uint32_t ptt_on_start_ms = 0;
 
-// PTT confirmation policy (set by station via config; default disabled)
-static bool require_ptt_confirm = false;
-
 // ---- Error handling ----
 static uint32_t err_bits = 0;
 static uint32_t stop_ptt_err_mask = 0;            // which errors should drop PTT
@@ -253,7 +250,7 @@ static void setPtt(bool on, uint8_t seq, bool forceSendStatus) {
   // confirmation handling (only meaningful when trying to be ON)
   bool confirmed = (on ? pttConfirmed() : false);
   bool ok = true;
-  if (on && require_ptt_confirm) {
+  if (on) {
     ok = confirmed;
     if (!confirmed) latchError(ERR_PTT_CONFIRM_FAIL);
   }
@@ -338,9 +335,6 @@ static void processCan() {
       // Stored locally as uint32; your internal err_bits are uint32 too
       stop_ptt_err_mask = val;
       break;
-    case RSCP_CFG_PTT_CONFIRM_ENABLE:
-      require_ptt_confirm = (val != 0);
-      break;
     default:
       ok = false;
       break;
@@ -411,15 +405,13 @@ void loop() {
 
   // 2) PTT confirm + overtime every loop
   if (ptt_active_hw) {
-    if (require_ptt_confirm) {
-      // confirm must remain valid
-      if (!pttConfirmed()) {
-        latchError(ERR_PTT_CONFIRM_FAIL);
-        setPtt(false, last_ptt_seq, true);
-      }
+    // confirm must remain valid
+    if (!pttConfirmed()) {
+      latchError(ERR_PTT_CONFIRM_FAIL);
+      setPtt(false, last_ptt_seq, true);
     }
 
-    // overtime enforcement (always active when PTT is ON)
+    // overtime enforcement
     if (!last_overtime_drop && (now_ms - ptt_on_start_ms) > max_ptt_ms) {
       last_overtime_drop = true;
       setPtt(false, last_ptt_seq, true);

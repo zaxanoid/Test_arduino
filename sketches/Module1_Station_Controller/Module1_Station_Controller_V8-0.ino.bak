@@ -47,7 +47,6 @@ static uint32_t lastM2RxMs = 0;  // any message from Module 2
 static bool    ptt_active    = false;  // local requested PTT state
 static bool    ptt_confirmed = false;  // true only when mast confirms PTT and no errors
 static uint8_t last_cmd_seq  = 0;      // last PTT_CMD sequence we sent
-static bool    ptt_in_active = false;  // external PTT input state (debounced)
 
 // MCP2515
 static const uint8_t CAN_CS_PIN   = 10;
@@ -267,7 +266,7 @@ void processCan() {
       case RSCP_ID_HEARTBEAT: {
         // data0=node_id, data1=ptt_active, data2..5=uptime_ms (u32 LE), data6=err_latched, data7=seq
         const uint8_t node = canRx.data[0];
-        if (node == RSCP_MOD_MAST) {
+        if (node == RSCP_NODE_MAST) {
           alive_m2 = true;
           lastM2RxMs = millis();
         }
@@ -378,6 +377,7 @@ void renderLCD() {
 // ======================================================
 
 // Local PTT state
+static bool     ptt_in_active = false;    // external PTT input state (debounced minimally)
 static uint8_t  ptt_seq = 0;              // increments on each command edge
 static uint32_t last_ptt_cmd_ms = 0;
 

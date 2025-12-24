@@ -126,8 +126,7 @@ enum : uint8_t {
   RSCP_CFG_VSWR2_HIGH_RAW     = 12, // uint32
   RSCP_CFG_TEMP1_HIGH_X10     = 13, // uint32 (degC x10)
   RSCP_CFG_TEMP2_HIGH_X10     = 14, // uint32 (degC x10)
-  RSCP_CFG_HUM_HIGH_PCT       = 15, // uint32 (%)
-  RSCP_CFG_PTT_CONFIRM_ENABLE = 16  // uint32 (0=disable confirm requirement, 1=require)
+  RSCP_CFG_HUM_HIGH_PCT       = 15  // uint32 (%)
 };
 
 // ------------------------- Little-endian helpers
