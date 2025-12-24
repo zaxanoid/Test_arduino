@@ -400,6 +400,7 @@ void setup() {
 
   sendBoot();
   sendHeartbeat();
+  Serial.println("M2 heartbeat sent"); // heartbeat sent serial mnessage
   sendErrStatus();
 }
 

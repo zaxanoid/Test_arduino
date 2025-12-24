@@ -98,13 +98,6 @@ bool alive_m2 = false;
 bool alive_m3 = false;
 bool alive_m4 = false;
 
-// ===== RSCP node presence tracking (any RX updates last-seen) =====
-static constexpr uint8_t  RSCP_MAX_MODULES = 16;
-static uint32_t module_last_seen_ms[RSCP_MAX_MODULES];
-static bool     module_seen[RSCP_MAX_MODULES];
-static constexpr uint32_t MODULE_OK_MS   = 3000UL;
-static constexpr uint32_t MODULE_LOST_MS = 8000UL;
-
 // CFG ACK status
 uint8_t cfgAckM2 = 0xFF;
 uint8_t cfgAckM3 = 0xFF;
@@ -212,24 +205,6 @@ void pushSettingsToRemotes() {
 
 void processCan() {
   while (mcp2515.readMessage(&canRx) == MCP2515::ERROR_OK) {
-    // Update module presence based on any received frame
-    uint8_t src = 0xFF;
-    switch (canRx.can_id) {
-      case RSCP_ID_HEARTBEAT:   src = canRx.data[0]; break;
-      case RSCP_ID_ERR_STATUS:  src = canRx.data[0]; break;
-      case RSCP_ID_CFG_ACK:     src = canRx.data[0]; break;
-      case RSCP_ID_PTT_STATUS:
-      case RSCP_ID_ENV_TELEM:
-      case RSCP_ID_RF_TELEM:    src = RSCP_MOD_MAST; break;
-      case RSCP_ID_HEADING:     src = RSCP_MOD_COMPASS; break;
-      case RSCP_ID_ROT_STATUS:  src = RSCP_MOD_ROTATOR; break;
-      default: break;
-    }
-    if (src < RSCP_MAX_MODULES) {
-      module_last_seen_ms[src] = millis();
-      module_seen[src] = true;
-    }
-
     switch (canRx.can_id) {
 
       
@@ -326,24 +301,6 @@ void processCan() {
 // ===== UI ==============================================
 // ======================================================
 
-static inline const char* moduleStatus2(uint8_t id, uint32_t now) {
-  if (id >= RSCP_MAX_MODULES) return "??";
-  if (!module_seen[id]) return "NA";
-  const uint32_t age = now - module_last_seen_ms[id];
-  if (age <= MODULE_OK_MS) return "OK";
-  if (age <= MODULE_LOST_MS) return "LO";
-  return "!!";
-}
-
-static inline char moduleStatus1(uint8_t id, uint32_t now) {
-  const char* s = moduleStatus2(id, now);
-  // Map to single char for compact display
-  if (s[0] == 'O') return 'O';
-  if (s[0] == 'N') return '-';
-  if (s[0] == 'L') return 'L';
-  return '!';
-}
-
 void renderLCD() {
   const uint32_t now = millis();
   const bool rfStale  = (now - lastRfMs)  > 4000UL;   // no RF telem in 4s
@@ -387,7 +344,7 @@ void renderLCD() {
   lcd.print(rotator_deg);
   lcd.print("    ");
 
-    // Line 3: PTT state + Module-2 presence + Error indicator
+  // Line 3: PTT state + Error + module alive
   lcd.setCursor(0,3);
   lcd.print("PTT:");
   if (!ptt_in_active) {
@@ -397,19 +354,17 @@ void renderLCD() {
   } else {
     lcd.print("REQ");
   }
-
-  lcd.print(" M2:");
-  lcd.print(moduleStatus2(RSCP_MOD_MAST, now));
-
   lcd.print(" E:");
-  // Error display only meaningful if M2 has been seen recently
-  const bool m2OkNow = (moduleStatus2(RSCP_MOD_MAST, now)[0] == 'O');
-  if (!m2OkNow) {
+  if (!m2Alive) {
     lcd.print("-");
   } else {
     lcd.print(mast.err_flags ? "Y" : "N");
   }
-  lcd.print("  ");
+  lcd.print(" ");
+  lcd.print(m2Alive ? "2" : "-");
+  lcd.print(alive_m3 ? "3" : "-");
+  lcd.print(alive_m4 ? "4" : "-");
+  lcd.print("   ");
 #endif
 }
 
@@ -495,12 +450,6 @@ void setup() {
   Wire.begin();
   lcd.init();
   lcd.backlight();
-
-  // Init module presence tracking
-  for (uint8_t i = 0; i < RSCP_MAX_MODULES; i++) {
-    module_last_seen_ms[i] = 0;
-    module_seen[i] = false;
-  }
 
   SPI.begin();
   mcp2515.reset();
