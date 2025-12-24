@@ -123,8 +123,6 @@ enum {
 static int16_t  temp1_x10_cache = 0;
 static uint8_t  hum_cache = 0;
 static uint16_t psu_raw_cache = 0;
-static uint16_t fwd_raw_cache = 0;
-static uint16_t rev_raw_cache = 0;
 
 static uint8_t  vswr_state_cache  = 0;  // 0 OK, 1 HIGH, 2 ERR
 static uint8_t  drive_state_cache = 0;  // 0 OK, 1 LOW, 2 HIGH
@@ -187,12 +185,6 @@ static bool pttConfirmed() {
   return (digitalRead(PIN_PTT_CONFIRM) == LOW);
 }
 
-static bool inhibitActive() {
-  // INHIBIT input: with INPUT_PULLUP, active when pulled LOW (recommended wiring)
-  return (digitalRead(PIN_PTT_INHIBIT) == LOW);
-}
-
-
 static void latchError(uint32_t bits) {
   err_bits |= bits;
   err_latched = (err_bits != 0);
@@ -227,6 +219,29 @@ static void sendErrStatus() {
   canSend8(RSCP_ID_ERR_STATUS, d);
 }
 
+static void sendPttStatus(bool result_ok, bool confirmed, bool inhibited) {
+  uint8_t d[8] = {0};
+  d[0] = ptt_active_hw ? RSCP_PTT_ON : RSCP_PTT_OFF;
+  d[1] = last_ptt_seq;
+  d[2] = result_ok ? 0 : 1;
+  d[3] = last_overtime_drop ? 1 : 0;
+
+  uint16_t lat = 0;
+  if (ptt_cmd_rx_ms != 0) {
+    uint32_t ms = now_ms - ptt_cmd_rx_ms;
+    lat = (uint16_t)((ms > 65535UL) ? 65535UL : ms);
+  }
+  put_u16(&d[4], lat);
+
+  uint8_t flags = 0;
+  if (confirmed) flags |= 0x01;
+  if (inhibited) flags |= 0x02;
+  if (last_overtime_drop) flags |= 0x04;
+  d[6] = flags;
+  d[7] = RSCP_NODE_MAST;
+
+  canSend8(RSCP_ID_PTT_STATUS, d);
+}
 
 static void setPtt(bool on, uint8_t seq, bool forceSendStatus) {
   // apply inhibit
@@ -349,7 +364,7 @@ static void processCan() {
   a[4] = a[5] = a[6] = a[7] = 0;
   canSend8(RSCP_ID_CFG_ACK, a);
 }
-else if (id == RSCP_ID_ERR_CLEAR) {
+else if (id == RSCP_ID_ERR_CLEAR)else if (id == RSCP_ID_ERR_CLEAR) {
       // optional: allow station to clear errors
       clearErrors();
     }
@@ -450,10 +465,8 @@ void loop() {
 
       case 2: { // VSWR states (only when PTT active)
         if (ptt_active_hw) {
-          fwd_raw_cache = (uint16_t)analogRead(PIN_FWD_ADC);
-          rev_raw_cache = (uint16_t)analogRead(PIN_REV_ADC);
-          uint16_t fwd = fwd_raw_cache;
-          uint16_t rev = rev_raw_cache;
+          uint16_t fwd = (uint16_t)analogRead(PIN_FWD_ADC);
+          uint16_t rev = (uint16_t)analogRead(PIN_REV_ADC);
           // placeholder: state logic (real VSWR calc later)
           if (fwd < 5) {
             vswr_state_cache = 2; // ERR - no forward power
@@ -478,7 +491,7 @@ void loop() {
   // 4) Telemetry (non-blocking; only one send per loop via gating)
   if ((int32_t)(now_ms - next_env_telem_ms) >= 0) {
     next_env_telem_ms = now_ms + ENV_TELEM_MS;
-    sendEnvTelem(temp1_x10_cache, hum_cache, 0x7FFF); // temp2 n/a by default
+    sendEnvTelem(temp1_x10_cache, hum_cache, psu_raw_cache);
   } else if ((int32_t)(now_ms - next_rf_telem_ms) >= 0) {
     next_rf_telem_ms = now_ms + RF_TELEM_MS;
     sendRfTelem(vswr_state_cache, drive_state_cache);

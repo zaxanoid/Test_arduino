@@ -123,8 +123,6 @@ enum {
 static int16_t  temp1_x10_cache = 0;
 static uint8_t  hum_cache = 0;
 static uint16_t psu_raw_cache = 0;
-static uint16_t fwd_raw_cache = 0;
-static uint16_t rev_raw_cache = 0;
 
 static uint8_t  vswr_state_cache  = 0;  // 0 OK, 1 HIGH, 2 ERR
 static uint8_t  drive_state_cache = 0;  // 0 OK, 1 LOW, 2 HIGH
