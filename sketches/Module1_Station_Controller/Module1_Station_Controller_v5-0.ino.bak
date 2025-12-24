@@ -3,15 +3,7 @@
 #include <EEPROM.h>
 #include <SPI.h>
 #include <mcp2515.h>
-#include "rscp_can_protocol.h"
-
-// ---- PTT_STATUS flag bits (v1.4 uses raw bitfield in data[2]) ----
-#ifndef RSCP_PTTSTAT_CONFIRMED
-#define RSCP_PTTSTAT_CONFIRMED 0x01
-#define RSCP_PTTSTAT_INHIBITED 0x02
-#define RSCP_PTTSTAT_OVERTIME  0x04
-#endif
-
+#include "rscp_can_protocol_fixed.h"
 
 // ======================================================
 // ===== DISPLAY SELECTION ===============================
@@ -41,11 +33,6 @@ static const uint8_t PIN_PTT_LED  = 5;   // PTT status LED
 static const uint8_t PIN_BTN      = 2;   // UI button (pullup)
 static uint32_t lastRfMs  = 0;
 static uint32_t lastEnvMs = 0;
-
-// ---- PTT handshake state ----
-static bool    ptt_active    = false;  // local requested PTT state
-static bool    ptt_confirmed = false;  // true only when mast confirms PTT and no errors
-static uint8_t last_cmd_seq  = 0;      // last PTT_CMD sequence we sent
 
 // MCP2515
 static const uint8_t CAN_CS_PIN   = 10;
@@ -323,8 +310,10 @@ void renderLCD() {
 // ======================================================
 
 // Local PTT state
-static bool     ptt_in_active = false;    // external PTT input state (debounced minimally)
+static bool     ptt_active = false;       // external PTT input state (debounced minimally)
+static bool     ptt_confirmed = false;    // remote confirmed
 static uint8_t  ptt_seq = 0;              // increments on each command edge
+static uint8_t  last_cmd_seq = 0;
 static uint32_t last_ptt_cmd_ms = 0;
 
 static inline void sendPttCmd(uint8_t onoff) {
@@ -334,9 +323,6 @@ static inline void sendPttCmd(uint8_t onoff) {
   d[2] = 0; // flags reserved
   last_cmd_seq = ptt_seq;
   last_ptt_cmd_ms = millis();
-  // Track local PTT request state (confirmation comes from RSCP_ID_PTT_STATUS)
-  ptt_active = (onoff != 0);
-  if (!ptt_active) ptt_confirmed = false;
 
   canTx.can_id  = RSCP_ID_PTT_CMD;
   canTx.can_dlc = 8;
@@ -349,16 +335,16 @@ void handlePtt() {
   const bool in = (digitalRead(PIN_PTT_IN) == LOW);
 
   // Rising edge: request PTT
-  if (in && !ptt_in_active) {
+  if (in && !ptt_active) {
     sendPttCmd(1);
-    ptt_in_active = true;
+    ptt_active = true;
     // do NOT assert PIN_PTT_OUT until confirmed by remote
   }
 
   // Falling edge: drop PTT immediately (and clear confirmation)
-  if (!in && ptt_in_active) {
+  if (!in && ptt_active) {
     sendPttCmd(0);
-    ptt_in_active = false;
+    ptt_active = false;
     ptt_confirmed = false;
   }
 
