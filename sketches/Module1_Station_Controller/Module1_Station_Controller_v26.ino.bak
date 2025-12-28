@@ -461,7 +461,7 @@ void setup() {
   // ===== TEMP SERIAL DEBUG (COMMENT OUT LATER) =====
   Serial.begin(115200);
   delay(800);
-  Serial.println("Module1 boot");
+  Serial.println(\"Module1 boot\");
   // ================================================
 
   SPI.begin();

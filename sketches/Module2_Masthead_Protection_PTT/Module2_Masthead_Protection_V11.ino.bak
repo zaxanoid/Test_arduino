@@ -143,7 +143,7 @@ static inline void put_u16(uint8_t *p, uint16_t v){ p[0]=(uint8_t)(v&0xFF); p[1]
 static inline uint16_t get_u16(const uint8_t *p){ return (uint16_t)p[0] | ((uint16_t)p[1]<<8); }
 static inline void put_i16(uint8_t *p, int16_t v){ put_u16(p, (uint16_t)v); }
 static inline int16_t get_i16(const uint8_t *p){ return (int16_t)get_u16(p); }
-static inline void put_u32(uint8_t *p, uint32_t v){ p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v>>16)&0xFF; p[3]=(v>>24)&0xFF; }
+static inline void put_u32(uint8_t *p, uint32_t v){ p[0]=(uint8_t)(v&0xFF); p[1]=(uint8_t)((v>>8)&0xFF); p[2]=(uint8_t)((v>>16)&0xFF); p[3]=(uint8_t)((v>>24)&0xFF); }
 static inline uint32_t get_u32(const uint8_t *p){ return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24); }
 
 // ---- CAN send ----
@@ -487,7 +487,7 @@ void loop() {
   // 5) Heartbeat (slow)
   static uint32_t next_hb = 0;
   if ((int32_t)(now_ms - next_hb) >= 0) {
-    next_hb = now_ms + 5000UL;
+    next_hb = now_ms + 1000UL;
     sendHeartbeat();
   }
 }
