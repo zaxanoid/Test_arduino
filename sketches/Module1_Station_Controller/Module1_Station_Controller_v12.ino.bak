@@ -40,9 +40,7 @@
 // ===== PIN DEFINITIONS =================================
 // ======================================================
 
-static const uint8_t PIN_PTT_IN   = 3;   
-static constexpr bool PTT_ACTIVE_HIGH = true; // HW: 10k pulldown, pressed=HIGH
-// external PTT input
+static const uint8_t PIN_PTT_IN   = 3;   // external PTT input
 static const uint8_t PIN_PTT_OUT  = 4;   // PTT confirm output
 static const uint8_t PIN_PTT_LED  = 5;   // PTT status LED
 static const uint8_t PIN_BTN      = 2;   // UI button (pullup)
@@ -51,7 +49,6 @@ static uint32_t lastEnvMs = 0;
 
 // ---- PTT handshake state ----
 static bool    ptt_active    = false;  // local requested PTT state
-static bool     ptt_in_active = false;    // external PTT input state (debounced minimally)  // TEMP: moved up for scope
 static bool    ptt_confirmed = false;  // true only when mast confirms PTT and no errors
 static uint8_t last_cmd_seq  = 0;      // last PTT_CMD sequence we sent
 static bool    require_confirm = false; // default DISABLED: treat remote PTT ON as OK even if confirm input not used
@@ -377,6 +374,7 @@ lcd.print(status2(lastM2Ms, ever_m2));
 // ======================================================
 
 // Local PTT state
+static bool     ptt_in_active = false;    // external PTT input state (debounced minimally)
 static uint8_t  ptt_seq = 0;              // increments on each command edge
 static uint32_t last_ptt_cmd_ms = 0;
 
@@ -398,9 +396,8 @@ static inline void sendPttCmd(uint8_t onoff) {
 }
 
 void handlePtt() {
-  // External PTT input: active HIGH (10k pulldown on line)
-  const bool in = PTT_ACTIVE_HIGH ? (digitalRead(PIN_PTT_IN) == HIGH)
-                             : (digitalRead(PIN_PTT_IN) == LOW);
+  // External PTT input: active LOW
+  const bool in = (digitalRead(PIN_PTT_IN) == LOW);
 
   // Rising edge: request PTT
   if (in && !ptt_in_active) {
@@ -434,7 +431,7 @@ void setup() {
   Serial.println("Module1 boot");
 #endif
 
-  pinMode(PIN_PTT_IN, INPUT); // active-HIGH input with external pulldown
+  pinMode(PIN_PTT_IN, INPUT_PULLUP);
   pinMode(PIN_PTT_OUT, OUTPUT);
   pinMode(PIN_PTT_LED, OUTPUT);
   pinMode(PIN_BTN, INPUT_PULLUP);
