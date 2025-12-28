@@ -439,6 +439,10 @@ now_ms = millis();
   // default: drop PTT on critical errors
   stop_ptt_err_mask = ERR_VSWR | ERR_DRIVE | ERR_PTT_CONFIRM_FAIL | ERR_PSU;
 
+Serial.begin(115200);
+delay(1500);                 // give Serial Monitor time to attach
+Serial.println("MODULE2 SERIAL OK - booted");
+
   sendBoot();
   sendHeartbeat();
   sendErrStatus();
@@ -446,6 +450,12 @@ now_ms = millis();
 
 void loop() {
   now_ms = millis();
+  
+  static unsigned long last = 0;
+  if (millis() - last > 1000) {
+    last = millis();
+    Serial.println("tick");
+  }
 
   // 1) Always process CAN first
   processCan();
