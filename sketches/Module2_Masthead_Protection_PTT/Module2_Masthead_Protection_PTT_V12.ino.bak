@@ -25,19 +25,6 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <mcp2515.h>
-// ===== TEMP DEBUG SERIAL (COMMENT OUT LATER) =====
-#define RSCP_DEBUG_SERIAL 1   // set to 0 later
-#if RSCP_DEBUG_SERIAL
-  #define DBG_BEGIN()    do{ Serial.begin(115200); delay(1500); }while(0)
-  #define DBG(...)       Serial.print(__VA_ARGS__)
-  #define DBGLN(...)     Serial.println(__VA_ARGS__)
-#else
-  #define DBG_BEGIN()
-  #define DBG(...)
-  #define DBGLN(...)
-#endif
-// ================================================
-
 
 #include "rscp_can_protocol.h"
 
@@ -118,9 +105,7 @@ static uint32_t ptt_on_start_ms = 0;
 
 // ---- Error handling ----
 static uint32_t err_bits = 0;
-static uint32_t stop_ptt_err_mask = 0;            
-static bool require_ptt_confirm = false;  // TEMP default: confirm disabled (auto-OK)
-// which errors should drop PTT
+static uint32_t stop_ptt_err_mask = 0;            // which errors should drop PTT
 static bool err_latched = false;
 
 // error bit assignments (keep aligned with CAN_Messages.md)
@@ -263,19 +248,13 @@ static void setPtt(bool on, uint8_t seq, bool forceSendStatus) {
   if (PIN_PTT_MIRROR_LED != 0xFF) digitalWrite(PIN_PTT_MIRROR_LED, on ? HIGH : LOW);
 
   // confirmation handling (only meaningful when trying to be ON)
-bool confirmed = (on ? pttConfirmed() : false);
-
-// If confirm is disabled (default), treat PTT as OK as soon as we assert the output.
-// If confirm is enabled, require confirmed LOW to be OK and latch error on failure.
-bool ok = true;
-if (on) {
-  if (require_ptt_confirm) {
+  bool confirmed = (on ? pttConfirmed() : false);
+  bool ok = true;
+  if (on) {
     ok = confirmed;
     if (!confirmed) latchError(ERR_PTT_CONFIRM_FAIL);
-  } else {
-    ok = true;
   }
-}
+
   if (forceSendStatus) {
     sendPttStatus(ok, confirmed, inhibited);
   }
@@ -356,10 +335,7 @@ static void processCan() {
       // Stored locally as uint32; your internal err_bits are uint32 too
       stop_ptt_err_mask = val;
       break;
-        case RSCP_CFG_PTT_CONFIRM_ENABLE:
-      require_ptt_confirm = (val != 0);
-      break;
-default:
+    default:
       ok = false;
       break;
   }
@@ -381,9 +357,7 @@ else if (id == RSCP_ID_ERR_CLEAR) {
 }
 
 void setup() {
-  DBG_BEGIN();
-  DBGLN("Module2 boot");
-pinMode(PIN_PTT_OUT, OUTPUT);
+  pinMode(PIN_PTT_OUT, OUTPUT);
   digitalWrite(PIN_PTT_OUT, LOW);
 
   pinMode(PIN_PTT_CONFIRM, INPUT_PULLUP); // confirm active low

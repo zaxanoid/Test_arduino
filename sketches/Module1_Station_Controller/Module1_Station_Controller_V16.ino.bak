@@ -28,8 +28,6 @@
   LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 16, 2);
 #else
   #include <LiquidCrystal_I2C.h>
-
-#define RSCP_DEBUG_CAN_RX 1  // TEMP: set to 0 later to disable CAN RX prints
   LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 20, 4);
 #endif
 
@@ -206,25 +204,6 @@ void pushSettingsToRemotes() {
 // ======================================================
 // ===== CAN RX ==========================================
 // ======================================================
-
-
-// ===== TEMP DEBUG CAN RX DUMP (COMMENT OUT LATER) =====
-#if RSCP_DEBUG_CAN_RX
-static void dbgPrintRx(const struct can_frame &f) {
-  Serial.print("M1 RX id=0x");
-  Serial.print((uint16_t)f.can_id, HEX);
-  Serial.print(" len=");
-  Serial.print(f.can_dlc);
-  Serial.print(" data=");
-  for (uint8_t i=0;i<f.can_dlc;i++){
-    if (f.data[i] < 16) Serial.print('0');
-    Serial.print(f.data[i], HEX);
-    Serial.print(' ');
-  }
-  Serial.println();
-}
-#endif
-// =====================================================
 
 void processCan() {
   while (mcp2515.readMessage(&canRx) == MCP2515::ERROR_OK) {
