@@ -28,8 +28,6 @@
   LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 16, 2);
 #else
   #include <LiquidCrystal_I2C.h>
-
-#define RSCP_DEBUG_CAN_RX 1  // TEMP: set to 0 later to disable CAN RX prints
   LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 20, 4);
 #endif
 
@@ -43,15 +41,11 @@ static const uint8_t PIN_PTT_LED  = 5;   // PTT status LED
 static const uint8_t PIN_BTN      = 2;   // UI button (pullup)
 static uint32_t lastRfMs  = 0;
 static uint32_t lastEnvMs = 0;
-static uint32_t lastM2RxMs = 0;  // any message from Module 2
-static bool haveEnv = false;   // TEMP: set true when first ENV_TELEM received
-static bool haveRf  = false;   // TEMP: set true when first RF_TELEM received
 
 // ---- PTT handshake state ----
 static bool    ptt_active    = false;  // local requested PTT state
 static bool    ptt_confirmed = false;  // true only when mast confirms PTT and no errors
 static uint8_t last_cmd_seq  = 0;      // last PTT_CMD sequence we sent
-static bool    ptt_in_active = false;  // external PTT input state (debounced)
 
 // MCP2515
 static const uint8_t CAN_CS_PIN   = 10;
@@ -73,7 +67,6 @@ struct Settings {
   int16_t  temp1_high_x10;
   int16_t  temp2_high_x10;
   uint8_t  hum_high_pct;
-  uint8_t  ptt_confirm_enable; // 0=disabled(default),1=require remote confirm
 };
 
 Settings settings;
@@ -164,8 +157,6 @@ void loadSettings() {
     settings.temp2_high_x10   = 0;
     settings.hum_high_pct     = 0;
 
-
-    settings.ptt_confirm_enable = 0;
     saveSettings();
   }
 }
@@ -187,7 +178,6 @@ void sendCfg(uint8_t destModule, uint8_t key, uint32_t value) {
 void pushSettingsToRemotes() {
   // Module 2 (masthead)
   sendCfg(RSCP_MOD_MAST, RSCP_CFG_PTT_MAX_MS,        settings.ptt_max_ms);
-  sendCfg(RSCP_MOD_MAST, RSCP_CFG_PTT_CONFIRM_ENABLE, (uint32_t)settings.ptt_confirm_enable);
   sendCfg(RSCP_MOD_MAST, RSCP_CFG_STOP_PTT_ERR_MASK, settings.stop_ptt_err_mask);
   sendCfg(RSCP_MOD_MAST, RSCP_CFG_VBAT_LOW_RAW,      settings.vbat_low_raw);
   sendCfg(RSCP_MOD_MAST, RSCP_CFG_VSWR1_HIGH_RAW,    settings.vswr1_high_raw);
@@ -207,30 +197,8 @@ void pushSettingsToRemotes() {
 // ===== CAN RX ==========================================
 // ======================================================
 
-
-// ===== TEMP DEBUG CAN RX DUMP (COMMENT OUT LATER) =====
-#if RSCP_DEBUG_CAN_RX
-static void dbgPrintRx(const struct can_frame &f) {
-  Serial.print("M1 RX id=0x");
-  Serial.print((uint16_t)f.can_id, HEX);
-  Serial.print(" len=");
-  Serial.print(f.can_dlc);
-  Serial.print(" data=");
-  for (uint8_t i=0;i<f.can_dlc;i++){
-    if (f.data[i] < 16) Serial.print('0');
-    Serial.print(f.data[i], HEX);
-    Serial.print(' ');
-  }
-  Serial.println();
-}
-#endif
-// =====================================================
-
 void processCan() {
   while (mcp2515.readMessage(&canRx) == MCP2515::ERROR_OK) {
-#if RSCP_DEBUG_CAN_RX
-    dbgPrintRx(canRx);
-#endif
     switch (canRx.can_id) {
 
       
@@ -241,19 +209,20 @@ void processCan() {
         const uint8_t flags = canRx.data[2];
         const bool errLatched = (canRx.data[3] != 0);
 
-        const bool remoteOn = (state == RSCP_PTT_ON) && !errLatched && ((flags & RSCP_PTTSTAT_INHIBITED) == 0);
-        const bool remoteConfirmed = ((flags & RSCP_PTTSTAT_CONFIRMED) != 0);
-        const bool remoteOk = remoteOn && (settings.ptt_confirm_enable ? remoteConfirmed : true);
+        // Interpret status from Module 2. The decision about "confirmation required" is LOCAL to Module 2.
+        // Module 1 should show ON when Module 2 reports ON and is not inhibited/failing.
+        const bool remoteOn        = (state == RSCP_PTT_ON);
+        const bool remoteInhibited = ((flags & RSCP_PTTSTAT_INHIBITED) != 0);
+        const bool remoteFail      = ((flags & 0x08) != 0); // Module2 local FAIL indicator (reserved bit)
 
-        // Only accept status for the most recent command sequence when ON, but always accept OFF as a safety drop.
+        // Only accept status for the most recent command sequence when ON; always accept OFF as a safety drop.
         if (seq == last_cmd_seq) {
-          ptt_confirmed = remoteOk;
+          ptt_confirmed = remoteOn && !remoteInhibited && !remoteFail;
         } else {
+
+          // If remote announces OFF for any seq, treat as OFF safety
           if (state == RSCP_PTT_OFF) ptt_confirmed = false;
         }
-
-        alive_m2 = true;
-        lastM2RxMs = millis();
         break;
       }
 
@@ -278,30 +247,13 @@ void processCan() {
         mast.humidity = canRx.data[2];
         mast.vbat_raw = rscp_get_u16(&canRx.data[3]);
         lastEnvMs = millis();
-        haveEnv = true;
-        alive_m2 = true;
-        lastM2RxMs = lastEnvMs;
         break;
 
       case RSCP_ID_RF_TELEM:
         mast.vswr_state  = canRx.data[0];
         mast.drive_state = canRx.data[1];
         lastRfMs = millis();
-        haveRf = true;
-        alive_m2 = true;
-        lastM2RxMs = lastRfMs;
         break;
-
-      case RSCP_ID_HEARTBEAT: {
-        // data0=node_id, data1=ptt_active, data2..5=uptime_ms (u32 LE), data6=err_latched, data7=seq
-        const uint8_t node = canRx.data[0];
-        if (node == RSCP_MOD_MAST) {
-          alive_m2 = true;
-          lastM2RxMs = millis();
-        }
-        // (Optional future: handle compass/rot heartbeat when those modules implement it)
-        break;
-      }
 
       case RSCP_ID_HEADING:
         compass_deg = rscp_get_u16(&canRx.data[0]);
@@ -318,8 +270,6 @@ void processCan() {
         if (canRx.data[0] == RSCP_MOD_COMPASS) cfgAckM3 = canRx.data[1];
         if (canRx.data[0] == RSCP_MOD_ROTATOR) cfgAckM4 = canRx.data[1];
 
-        // Treat any cfg ack as proof of life
-        if (canRx.data[0] == RSCP_MOD_MAST) { alive_m2 = true; lastM2RxMs = millis(); }
         break;
     }
   }
@@ -331,68 +281,38 @@ void processCan() {
 
 void renderLCD() {
   const uint32_t now = millis();
-  const bool rfValid  = haveRf  && (now - lastRfMs)  <= 4000UL;
-  const bool envValid = haveEnv && (now - lastEnvMs) <= 6000UL;
-  const bool m2Alive  = (lastM2RxMs != 0) && ((now - lastM2RxMs) < 3000UL);
+  const bool rfStale = (now - lastRfMs) > 4000UL;  // no RF telem in 4s
+  const bool envStale = (now - lastEnvMs) > 6000UL; // no ENV telem in 6s
 
-  // Line 0: VSWR + Drive
   lcd.setCursor(0,0);
   lcd.print("VSWR:");
-  lcd.print(!rfValid ? "N/A" : vswrText(mast.vswr_state));
-  lcd.print(" ");
+  lcd.print(vswrText(mast.vswr_state));
   lcd.setCursor(9,0);
   lcd.print("DRV:");
-  lcd.print(!rfValid ? "N/A" : driveText(mast.drive_state));
-  lcd.print(" ");
+  lcd.print(driveText(mast.drive_state));
 
-  // Line 1: Temp + Voltage
   lcd.setCursor(0,1);
   lcd.print("Temp:");
-  if (!envValid) {
-    lcd.print("N/A ");
-  } else {
-    lcd.print(mast.temp_x10 / 10.0, 1);
-    lcd.print(" ");
-  }
+  lcd.print(mast.temp_x10 / 10.0, 1);
   lcd.setCursor(9,1);
   lcd.print("V:");
-  if (!envValid) {
-    lcd.print("N/A ");
-  } else {
-    lcd.print(vbatVoltsFromRaw(mast.vbat_raw), 1);
-    lcd.print(" ");
-  }
+  lcd.print(vbatVoltsFromRaw(mast.vbat_raw), 1);
 
 #ifndef USE_LCD_16x2
-  // Line 2: Bearings
   lcd.setCursor(0,2);
   lcd.print("Bear:");
   lcd.print(compass_deg);
   lcd.print(" Rot:");
   lcd.print(rotator_deg);
-  lcd.print("    ");
 
-  // Line 3: PTT state + Error + module alive
   lcd.setCursor(0,3);
   lcd.print("PTT:");
-  if (!ptt_in_active) {
-    lcd.print("OFF");
-  } else if (ptt_confirmed) {
-    lcd.print("ON ");
-  } else {
-    lcd.print("REQ");
-  }
+  lcd.print(ptt_active ? "ON " : "OFF");
   lcd.print(" E:");
-  if (!m2Alive) {
-    lcd.print("-");
-  } else {
-    lcd.print(mast.err_flags ? "Y" : "N");
-  }
-  lcd.print(" ");
-  lcd.print(m2Alive ? "2" : "-");
+  lcd.print(mast.err_flags ? "Y " : "N ");
+  lcd.print(alive_m2 ? "2" : "-");
   lcd.print(alive_m3 ? "3" : "-");
   lcd.print(alive_m4 ? "4" : "-");
-  lcd.print("   ");
 #endif
 }
 
@@ -406,6 +326,7 @@ void renderLCD() {
 // ======================================================
 
 // Local PTT state
+static bool     ptt_in_active = false;    // external PTT input state (debounced minimally)
 static uint8_t  ptt_seq = 0;              // increments on each command edge
 static uint32_t last_ptt_cmd_ms = 0;
 
@@ -427,29 +348,14 @@ static inline void sendPttCmd(uint8_t onoff) {
 }
 
 void handlePtt() {
-  // External PTT input: active HIGH (10k pulldown fitted)
-  const uint32_t now = millis();
-  const bool raw = (digitalRead(PIN_PTT_IN) == HIGH);
-
-  // Minimal debounce (edge-cleaning) without slowing the fast loop
-  static bool last_raw = false;
-  static bool stable = false;
-  static uint32_t last_change_ms = 0;
-  if (raw != last_raw) {
-    last_raw = raw;
-    last_change_ms = now;
-  }
-  if ((now - last_change_ms) >= 5) {
-    stable = last_raw;
-  }
-
-  const bool in = stable;
+  // External PTT input: active LOW
+  const bool in = (digitalRead(PIN_PTT_IN) == LOW);
 
   // Rising edge: request PTT
   if (in && !ptt_in_active) {
     sendPttCmd(1);
     ptt_in_active = true;
-    // do NOT assert PIN_PTT_OUT until remote reports ON (and confirm, if enabled)
+    // do NOT assert PIN_PTT_OUT until confirmed by remote
   }
 
   // Falling edge: drop PTT immediately (and clear confirmation)
@@ -459,7 +365,8 @@ void handlePtt() {
     ptt_confirmed = false;
   }
 
-  // LED reflects local request; OUT reflects remote OK per policy
+  // If we are active but not confirmed for too long, keep output low.
+  // (remote may be inhibited or offline)
   digitalWrite(PIN_PTT_LED, ptt_active);
   digitalWrite(PIN_PTT_OUT, ptt_confirmed);
 }
@@ -470,7 +377,7 @@ void handlePtt() {
 // ======================================================
 
 void setup() {
-  pinMode(PIN_PTT_IN, INPUT);  // active HIGH with external 10k pulldown
+  pinMode(PIN_PTT_IN, INPUT_PULLUP);
   pinMode(PIN_PTT_OUT, OUTPUT);
   pinMode(PIN_PTT_LED, OUTPUT);
   pinMode(PIN_BTN, INPUT_PULLUP);
@@ -479,15 +386,9 @@ void setup() {
   lcd.init();
   lcd.backlight();
 
-  // ===== TEMP SERIAL DEBUG (COMMENT OUT LATER) =====
-  Serial.begin(115200);
-  delay(800);
-  Serial.println("Module1 boot");
-  // ================================================
-
   SPI.begin();
   mcp2515.reset();
-  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
+  mcp2515.setBitrate(CAN_500KBPS);
   mcp2515.setNormalMode();
 
   loadSettings();

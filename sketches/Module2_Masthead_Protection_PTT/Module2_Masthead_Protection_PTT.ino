@@ -25,34 +25,24 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <mcp2515.h>
-// ===== TEMP DEBUG SERIAL (COMMENT OUT LATER) =====
-#define RSCP_DEBUG_SERIAL 1   // set to 0 later
-#if RSCP_DEBUG_SERIAL
-  #define DBG_BEGIN()    do{ Serial.begin(115200); delay(1500); }while(0)
-  #define DBG(...)       Serial.print(__VA_ARGS__)
-  #define DBGLN(...)     Serial.println(__VA_ARGS__)
-#else
-  #define DBG_BEGIN()
-  #define DBG(...)
-  #define DBGLN(...)
-#endif
-// ================================================
-
 
 #include "rscp_can_protocol.h"
 
 
 // ---- Compatibility aliases (older/newer protocol headers)
-#ifndef RSCP_MOD_MAST
-#define RSCP_MOD_MAST RSCP_MOD_MAST
+#ifndef RSCP_NODE_MAST
+#define RSCP_NODE_MAST RSCP_MOD_MAST
 #endif
-#ifndef RSCP_MOD_BROADCAST
+#ifndef RSCP_NODE_BROADCAST
 // In v1.4 header broadcast module ID is not defined; we use 0 to mean "all modules"
-#define RSCP_MOD_BROADCAST 0
+#define RSCP_NODE_BROADCAST 0
 #endif
 #ifndef RSCP_CFG_DROP_MASK
 // Older docs used DROP_MASK; protocol header uses STOP_PTT_ERR_MASK
 #define RSCP_CFG_DROP_MASK RSCP_CFG_STOP_PTT_ERR_MASK
+#endif
+#ifndef RSCP_CFG_PTT_CONFIRM_ENABLE
+#define RSCP_CFG_PTT_CONFIRM_ENABLE 16
 #endif
 // ---- Optional sensors ----
 #include <DHT.h>
@@ -113,14 +103,14 @@ static uint32_t ptt_cmd_rx_ms = 0;
 static bool     last_overtime_drop = false;
 
 // overtime protection (set via config later)
-static uint32_t max_ptt_ms = 300000UL;    // 300s default
+static uint32_t max_ptt_ms = 300000UL;
+static bool ptt_require_confirm = false; // LOCAL decision: require confirm input to be true when PTT ON
+    // 300s default
 static uint32_t ptt_on_start_ms = 0;
 
 // ---- Error handling ----
 static uint32_t err_bits = 0;
-static uint32_t stop_ptt_err_mask = 0;            
-static bool require_ptt_confirm = false;  // TEMP default: confirm disabled (auto-OK)
-// which errors should drop PTT
+static uint32_t stop_ptt_err_mask = 0;            // which errors should drop PTT
 static bool err_latched = false;
 
 // error bit assignments (keep aligned with CAN_Messages.md)
@@ -194,6 +184,9 @@ static void sendPttStatus(bool result_ok, bool confirmed, bool inhibited) {
   d[3] = err_latched ? 1 : 0;
 
   d[4] = d[5] = d[6] = d[7] = 0;
+  DBG("PTT_STATUS TX: state="); DBG((int)d[0]);
+  DBG(" seq="); DBG((int)d[1]);
+  DBG(" flags=0x"); DBGLN(d[2], HEX);
   canSend8(RSCP_ID_PTT_STATUS, d);
 }
 
@@ -262,21 +255,25 @@ static void setPtt(bool on, uint8_t seq, bool forceSendStatus) {
   digitalWrite(PIN_PTT_OUT, on ? HIGH : LOW);
   if (PIN_PTT_MIRROR_LED != 0xFF) digitalWrite(PIN_PTT_MIRROR_LED, on ? HIGH : LOW);
 
-  // confirmation handling (only meaningful when trying to be ON)
-bool confirmed = (on ? pttConfirmed() : false);
+  // confirmation handling (local policy)
+  bool confirmed = (on ? pttConfirmed() : false);
+  bool ok = true;
 
-// If confirm is disabled (default), treat PTT as OK as soon as we assert the output.
-// If confirm is enabled, require confirmed LOW to be OK and latch error on failure.
-bool ok = true;
-if (on) {
-  if (require_ptt_confirm) {
-    ok = confirmed;
-    if (!confirmed) latchError(ERR_PTT_CONFIRM_FAIL);
-  } else {
-    ok = true;
+  if (on) {
+    if (ptt_require_confirm) {
+      ok = confirmed;
+      if (!confirmed) {
+        // Only treat as an error when confirmation is required
+        latchError(ERR_PTT_CONFIRM_FAIL);
+      }
+    } else {
+      // Confirmation disabled: consider PTT OK as soon as output asserted
+      confirmed = false;
+      ok = true;
+    }
   }
-}
-  if (forceSendStatus) {
+
+if (forceSendStatus) {
     sendPttStatus(ok, confirmed, inhibited);
   }
 }
@@ -306,7 +303,7 @@ static void sendRfTelem(uint8_t vswr_state, uint8_t drive_state) {
 
 static void sendBoot() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_MOD_MAST;
+  d[0] = RSCP_NODE_MAST;
   d[1] = 1; // boot
   put_u16(&d[2], 0); // reset reason (todo)
   put_u32(&d[4], 0);
@@ -315,7 +312,7 @@ static void sendBoot() {
 
 static void sendHeartbeat() {
   uint8_t d[8] = {0};
-  d[0] = RSCP_MOD_MAST;
+  d[0] = RSCP_NODE_MAST;
   d[1] = ptt_active_hw ? 1 : 0;
   put_u32(&d[2], (uint32_t)now_ms);
   d[6] = err_latched ? 1 : 0;
@@ -336,13 +333,15 @@ static void processCan() {
       last_ptt_seq = d[1];
       ptt_cmd_rx_ms = now_ms;
       ptt_requested = on;
+      DBG("PTT_CMD RX: on="); DBG(on ? 1 : 0);
+      DBG(" seq="); DBGLN((int)last_ptt_seq);
       // Apply immediately; force status back
       setPtt(on, last_ptt_seq, true);
     }
     else if (id == RSCP_ID_CFG_SET) {
   // Protocol v1.4: data0=module_id (0=broadcast), data1=key, data2..5=u32 value
   const uint8_t dest = d[0];
-  if (dest != RSCP_MOD_MAST && dest != RSCP_MOD_BROADCAST) continue;
+  if (dest != RSCP_MOD_MAST && dest != RSCP_NODE_BROADCAST) continue;
 
   const uint8_t key = d[1];
   const uint32_t val = get_u32(&d[2]);
@@ -356,10 +355,10 @@ static void processCan() {
       // Stored locally as uint32; your internal err_bits are uint32 too
       stop_ptt_err_mask = val;
       break;
-        case RSCP_CFG_PTT_CONFIRM_ENABLE:
-      require_ptt_confirm = (val != 0);
+    case RSCP_CFG_PTT_CONFIRM_ENABLE:
+      ptt_require_confirm = (val != 0);
       break;
-default:
+    default:
       ok = false;
       break;
   }
@@ -381,9 +380,13 @@ else if (id == RSCP_ID_ERR_CLEAR) {
 }
 
 void setup() {
+  // ===== TEMP DEBUG SERIAL (COMMENT OUT LATER) =====
   DBG_BEGIN();
   DBGLN("Module2 boot");
-pinMode(PIN_PTT_OUT, OUTPUT);
+  DBG("ptt_require_confirm="); DBGLN(ptt_require_confirm ? 1 : 0);
+  // ================================================
+
+  pinMode(PIN_PTT_OUT, OUTPUT);
   digitalWrite(PIN_PTT_OUT, LOW);
 
   pinMode(PIN_PTT_CONFIRM, INPUT_PULLUP); // confirm active low
@@ -407,10 +410,11 @@ pinMode(PIN_PTT_OUT, OUTPUT);
 
   SPI.begin();
   mcp2515.reset();
-  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
-  mcp2515.setNormalMode();
-
-  now_ms = millis();
+  MCP2515::ERROR e1 = mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
+  MCP2515::ERROR e2 = mcp2515.setNormalMode();
+  DBG("CAN setBitrate="); DBGLN((int)e1);
+  DBG("CAN setNormalMode="); DBGLN((int)e2);
+now_ms = millis();
   next_sensor_tick_ms = now_ms + SENSOR_TICK_MS;
   next_env_telem_ms = now_ms + 200;
   next_rf_telem_ms  = now_ms + 200;
@@ -425,19 +429,22 @@ pinMode(PIN_PTT_OUT, OUTPUT);
 
 void loop() {
   now_ms = millis();
-
-  // 1) Always process CAN first
+  static uint32_t dbg_last = 0;
+  if (now_ms - dbg_last >= 1000) { dbg_last = now_ms; DBG("."); }
+// 1) Always process CAN first
   processCan();
 
   // 2) PTT confirm + overtime every loop
   if (ptt_active_hw) {
-    // confirm must remain valid
-    if (!pttConfirmed()) {
-      latchError(ERR_PTT_CONFIRM_FAIL);
-      setPtt(false, last_ptt_seq, true);
+    // confirm must remain valid (only if local policy requires it)
+    if (ptt_require_confirm) {
+      if (!pttConfirmed()) {
+        latchError(ERR_PTT_CONFIRM_FAIL);
+        setPtt(false, last_ptt_seq, true);
+      }
     }
 
-    // overtime enforcement
+// overtime enforcement
     if (!last_overtime_drop && (now_ms - ptt_on_start_ms) > max_ptt_ms) {
       last_overtime_drop = true;
       setPtt(false, last_ptt_seq, true);
