@@ -48,9 +48,9 @@
 #ifndef RSCP_NODE_MAST
 #define RSCP_NODE_MAST RSCP_MOD_MAST
 #endif
-#ifndef RSCP_MOD_BROADCAST
+#ifndef RSCP_NODE_BROADCAST
 // In v1.4 header broadcast module ID is not defined; we use 0 to mean "all modules"
-#define RSCP_MOD_BROADCAST 0
+#define RSCP_NODE_BROADCAST 0
 #endif
 #ifndef RSCP_CFG_DROP_MASK
 // Older docs used DROP_MASK; protocol header uses STOP_PTT_ERR_MASK
@@ -356,7 +356,7 @@ static void processCan() {
     else if (id == RSCP_ID_CFG_SET) {
   // Protocol v1.4: data0=module_id (0=broadcast), data1=key, data2..5=u32 value
   const uint8_t dest = d[0];
-  if (dest != RSCP_MOD_MAST && dest != RSCP_MOD_BROADCAST) continue;
+  if (dest != RSCP_MOD_MAST && dest != RSCP_NODE_BROADCAST) continue;
 
   const uint8_t key = d[1];
   const uint32_t val = get_u32(&d[2]);

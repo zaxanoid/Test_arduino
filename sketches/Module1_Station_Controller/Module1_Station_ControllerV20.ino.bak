@@ -5,19 +5,6 @@
 #include <mcp2515.h>
 #include "rscp_can_protocol.h"
 
-
-// ===== TEMP PTT DIAGNOSTICS (COMMENT OUT LATER) =====
-#define RSCP_DEBUG_PTT 1
-#if RSCP_DEBUG_PTT
-  #define PTTDBG_BEGIN() do{ Serial.begin(115200); delay(1500); Serial.println(F("Module1 boot")); }while(0)
-  #define PTTDBG(...)   Serial.print(__VA_ARGS__)
-  #define PTTDBGLN(...) Serial.println(__VA_ARGS__)
-#else
-  #define PTTDBG_BEGIN()
-  #define PTTDBG(...)
-  #define PTTDBGLN(...)
-#endif
-// =====================================================
 // ---- PTT_STATUS flag bits (v1.4 uses raw bitfield in data[2]) ----
 #ifndef RSCP_PTTSTAT_CONFIRMED
 #define RSCP_PTTSTAT_CONFIRMED 0x01
@@ -161,7 +148,7 @@ void loadSettings() {
     settings.ptt_max_ms        = 300000;
     settings.compass_period_ms = 500;
     settings.rotator_period_ms = 500;
-    settings.stop_ptt_err_mask = 0x000000F3;
+    settings.stop_ptt_err_mask = 0x000000FF;
 
     settings.vbat_low_raw     = 0;
     settings.vswr1_high_raw   = 0;
@@ -216,32 +203,27 @@ void processCan() {
 
       
       case RSCP_ID_PTT_STATUS: {
-  // data0=state, data1=seq, data2=status_flags, data3=err_latched
-  const uint8_t state = canRx.data[0];
-  const uint8_t seq   = canRx.data[1];
-  const uint8_t flags = canRx.data[2];
-  const bool errLatched = (canRx.data[3] != 0);
+        // data0=state, data1=seq, data2=status_flags, data3=err_latched
+        const uint8_t state = canRx.data[0];
+        const uint8_t seq   = canRx.data[1];
+        const uint8_t flags = canRx.data[2];
+        const bool errLatched = (canRx.data[3] != 0);
 
-  const bool inhibited = ((flags & RSCP_PTTSTAT_INHIBITED) != 0);
-  const bool remoteOn  = (state == RSCP_PTT_ON) && !errLatched && !inhibited;
+        // Only accept confirmation for the most recent command sequence
+        if (seq == last_cmd_seq) {
+          if (state == RSCP_PTT_ON) {
+            ptt_confirmed = ((flags & RSCP_PTTSTAT_CONFIRMED) != 0) && !errLatched;
+          } else {
+            ptt_confirmed = false;
+          }
+        } else {
+          // If remote announces OFF for any seq, treat as OFF safety
+          if (state == RSCP_PTT_OFF) ptt_confirmed = false;
+        }
+        break;
+      }
 
-  // Confirmation is a LOCAL decision in Module 2. For now we treat "remoteOn" as success.
-  // (Module 2 may choose to set CONFIRMED flag when it has hardware confirmation available.)
-  if (seq == last_cmd_seq) {
-    ptt_confirmed = remoteOn;
-  } else {
-    if (state == RSCP_PTT_OFF) ptt_confirmed = false;
-  }
-
-  // TEMP DIAGNOSTIC
-  PTTDBG(F("M1 RX PTT_STATUS state=")); PTTDBG((int)state);
-  PTTDBG(F(" seq=")); PTTDBG((int)seq);
-  PTTDBG(F(" flags=0x")); PTTDBG(flags, HEX);
-  PTTDBG(F(" err=")); PTTDBGLN(errLatched ? 1 : 0);
-
-  break;
-}
-case RSCP_ID_ERR_STATUS: {
+      case RSCP_ID_ERR_STATUS: {
         // data0=module_id, data1=severity, data2..5=err_bits(uint32)
         const uint8_t mod = canRx.data[0];
         const uint8_t sev = canRx.data[1];
@@ -301,18 +283,32 @@ void renderLCD() {
 
   lcd.setCursor(0,0);
   lcd.print("VSWR:");
-  lcd.print(vswrText(mast.vswr_state));
+  if (rfStale || lastRfMs == 0) {
+    lcd.print("N/A ");
+  } else {
+    lcd.print(vswrText(mast.vswr_state));
+  }
   lcd.setCursor(9,0);
   lcd.print("DRV:");
-  lcd.print(driveText(mast.drive_state));
-
-  lcd.setCursor(0,1);
+  if (rfStale || lastRfMs == 0) {
+    lcd.print("N/A");
+  } else {
+    lcd.print(driveText(mast.drive_state));
+  }
+lcd.setCursor(0,1);
   lcd.print("Temp:");
-  lcd.print(mast.temp_x10 / 10.0, 1);
+  if (envStale || lastEnvMs == 0) {
+    lcd.print("N/A ");
+  } else {
+    lcd.print(mast.temp_x10 / 10.0, 1);
+  }
   lcd.setCursor(9,1);
   lcd.print("V:");
-  lcd.print(vbatVoltsFromRaw(mast.vbat_raw), 1);
-
+  if (envStale || lastEnvMs == 0) {
+    lcd.print("N/A");
+  } else {
+    lcd.print(vbatVoltsFromRaw(mast.vbat_raw), 1);
+  }
 #ifndef USE_LCD_16x2
   lcd.setCursor(0,2);
   lcd.print("Bear:");
@@ -322,8 +318,18 @@ void renderLCD() {
 
   lcd.setCursor(0,3);
   lcd.print("PTT:");
-  lcd.print(ptt_active ? "ON " : "OFF");
-  lcd.print(" E:");
+  // UI state machine (authoritative):
+  // OFF  = switch not pressed
+  // REQ  = switch pressed, command sent, waiting for mast
+  // ON   = mast reports PTT ON and not inhibited/fail
+  if (!ptt_active) {
+    lcd.print("OFF");
+  } else if (ptt_confirmed) {
+    lcd.print("ON ");
+  } else {
+    lcd.print("REQ");
+  }
+lcd.print(" E:");
   lcd.print(mast.err_flags ? "Y " : "N ");
   lcd.print(alive_m2 ? "2" : "-");
   lcd.print(alive_m3 ? "3" : "-");
@@ -363,21 +369,32 @@ static inline void sendPttCmd(uint8_t onoff) {
 }
 
 void handlePtt() {
-  // External PTT input: active HIGH (10k pulldown, pressed=HIGH)
+  // External PTT input: active HIGH (external 10k pulldown, pressed=HIGH)
+  // TEMP NOTE: if your wiring changes, flip this expression.
   const bool in = (digitalRead(PIN_PTT_IN) == HIGH);
 
-  // Rising edge: request PTT
-  if (in && !ptt_in_active) {
+  // --- minimal debounce (fast-loop friendly) ---
+  static bool in_db = false;
+  static bool last_raw = false;
+  static uint8_t stable = 0;
+  if (in == last_raw) {
+    if (stable < 6) stable++;          // ~6 consecutive loops stable
+  } else {
+    stable = 0;
+    last_raw = in;
+  }
+  if (stable == 6) in_db = in;
+
+// Rising edge: request PTT
+  if (in_db && !ptt_in_active) {
     sendPttCmd(1);
-    PTTDBG(F("M1 TX PTT_CMD ON seq=")); PTTDBGLN((int)last_cmd_seq);
     ptt_in_active = true;
     // do NOT assert PIN_PTT_OUT until confirmed by remote
   }
 
   // Falling edge: drop PTT immediately (and clear confirmation)
-  if (!in && ptt_in_active) {
+  if (!in_db && ptt_in_active) {
     sendPttCmd(0);
-    PTTDBG(F("M1 TX PTT_CMD OFF seq=")); PTTDBGLN((int)last_cmd_seq);
     ptt_in_active = false;
     ptt_confirmed = false;
   }
@@ -394,7 +411,7 @@ void handlePtt() {
 // ======================================================
 
 void setup() {
-  pinMode(PIN_PTT_IN, INPUT); // external 10k pulldown, pressed=HIGH
+  pinMode(PIN_PTT_IN, INPUT); // active-HIGH (external 10k pulldown)
   pinMode(PIN_PTT_OUT, OUTPUT);
   pinMode(PIN_PTT_LED, OUTPUT);
   pinMode(PIN_BTN, INPUT_PULLUP);
@@ -403,11 +420,9 @@ void setup() {
   lcd.init();
   lcd.backlight();
 
-  PTTDBG_BEGIN();
-
   SPI.begin();
   mcp2515.reset();
-  mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);
+  mcp2515.setBitrate(CAN_500KBPS);
   mcp2515.setNormalMode();
 
   loadSettings();

@@ -161,7 +161,7 @@ void loadSettings() {
     settings.ptt_max_ms        = 300000;
     settings.compass_period_ms = 500;
     settings.rotator_period_ms = 500;
-    settings.stop_ptt_err_mask = 0x000000F3;
+    settings.stop_ptt_err_mask = 0x000000FF;
 
     settings.vbat_low_raw     = 0;
     settings.vswr1_high_raw   = 0;
